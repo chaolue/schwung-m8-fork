@@ -608,6 +608,68 @@ Node harness caught it on the first run because it actually IMPORTS the
 module. Worth remembering that `node --check` passing means very little
 here.
 
+**Round 12: song presets on the alternate step buttons, and two reorderings.**
+
+- **The odd step notes finally have a job.** The LPP grid claims the EVEN
+  step notes (16-30, which carry M8's mute states), so the odd ones
+  (17-31) - the physical buttons in between, unclaimed since the bank
+  system was deleted - are now song presets. The first eight songs sit on
+  them in list order: press one to switch. Lit **white** for the song you
+  are on, **dim** for a button with a song behind it, **dark** for one
+  without, so the row shows both how many songs exist and where you are
+  among them. An empty button does nothing rather than clamping onto a
+  neighbouring song.
+- **Songs reorder with Shift+jog** in Song Management, which is also how a
+  song is moved onto a different preset button - the two are the same
+  fact, since the buttons are just the first eight list positions. The
+  cursor travels with the song so a held Shift keeps moving the same one.
+- **Knobs reorder from a `Slot` row** in Knob Settings: click to enter,
+  jog to move, swapping with whatever occupies the target so nothing is
+  displaced off the page. Within the current page only - a slot IS a
+  physical encoder, and moving a knob to a page you are not looking at
+  would put it under no encoder at all. A knob keeps its name, CC and
+  value; only its position changes. Moving a member of a multi-knob
+  graphic can break the group's contiguity, at which point viz.mjs stops
+  forming it and the members revert to ordinary dials; moving it back
+  restores the picture.
+
+`setLED` caches, so an unchanged colour is never re-sent - which is
+correct on the device and a trap in a test that clears its MIDI buffer and
+then expects a repaint. `test_presets.mjs` accumulates the last colour per
+step across the whole run instead, which is what the hardware is actually
+showing.
+
+Note that inserting the `Slot` row shifted every row index below it, which
+broke six checks in `test_wizard2.mjs` that reach Add/Remove by counting
+jog steps. Worth knowing that the Knob Settings row order is load-bearing
+for the tests.
+
+**Round 13: a graphic moves as one block.**
+
+Round 12's knob move stepped a single knob one slot, which for a member of
+a multi-knob graphic meant sliding it out from under its own picture: the
+group loses contiguity, viz.mjs stops forming it, and the picture vanishes
+until the knob is put back. Moving one member was never what was wanted.
+
+`knobMoveBlock` now resolves the edited knob to its whole group (or to
+just itself), and the block moves together. Two consequences fall out of
+the same change:
+
+- **The step is "next VALID start", not "one slot".** `validBlockStarts`
+  enumerates the positions where a block of that size fits inside a single
+  row - `[0,1,4,5]` for three knobs, `[0,4]` for four, all eight for a
+  lone knob. So a block that cannot slide within its row jumps to the
+  other row instead, which is the only way a four-knob envelope can be
+  moved at all. It also makes an invalid position unreachable rather than
+  merely discouraged.
+- **Displaced knobs come back into the vacated slots**, and the two counts
+  always match, so nothing is created or lost: a step within a row rotates
+  the neighbour around the block, and a jump to the other row swaps the
+  two blocks whole.
+
+The `Slot` row reports a range (`1-3`) when a graphic will travel, so the
+row says the whole picture moves rather than this one knob.
+
 ## Decisions made so far
 
 - **Song list is open-ended**: create / rename / delete, not a fixed count.

@@ -256,6 +256,41 @@ function updateMoveViewPulse() {
     }
 }
 
+/* Song presets on the ALTERNATE step buttons.
+ *
+ * The LPP grid claims the EVEN step notes (16-30 - they carry M8's mute
+ * states, see lppPadToMovePadMapTop), so these odd ones are the physical
+ * buttons in between, unclaimed since the bank system was deleted. The
+ * first eight songs sit on them in list order, which is why reordering
+ * songs in Song Management is also how a song is moved to a different
+ * button.
+ *
+ * Lit white for the song you are on, dim for a button that has a song
+ * behind it, dark for one that does not - so the row says both how many
+ * songs there are and where you are among them. */
+const SONG_STEP_NOTES = [17, 19, 21, 23, 25, 27, 29, 31];
+
+function updateSongStepLeds() {
+    SONG_STEP_NOTES.forEach((note, i) => {
+        const song = songs[i];
+        if (!song) { setLED(note, black); return; }
+        setLED(note, song.id === activeSongId ? white : dim_grey);
+    });
+}
+
+/* Pressing one of those buttons switches song. Silent for a button with
+ * no song behind it rather than wrapping or clamping onto another song -
+ * an empty preset should do nothing, not something surprising. */
+function selectSongByStep(index) {
+    const song = songs[index];
+    if (!song || song.id === activeSongId) return;
+    activeSongId = song.id;
+    activePageIndex = 0;
+    cachedSongId = null;   /* different song, different page shape */
+    markSongsDirty();
+    updateSongStepLeds();
+}
+
 function updatePLAYLed() {
     if (!liveMode && !isPlaying) setButtonLED(movePLAY, light_grey);
     if (!liveMode && isPlaying) setButtonLED(movePLAY, green);
@@ -283,6 +318,7 @@ function markM8Connected() {
     initRetryTicks = 0;
     showingTop = true;
     loadSongs();
+    updateSongStepLeds();
 }
 
 function initLPP() {
@@ -989,6 +1025,7 @@ function closeSongManagement() {
      * Reuse the same resync path the view-toggle uses to catch it up. */
     queuePadRedraw();
     updateMoveViewPulse();
+    updateSongStepLeds();
 }
 
 function renameSong(song) {
@@ -1008,7 +1045,25 @@ function createSong() {
     songs.push(song);
     songMgmtCursor = songs.length; /* row 0 is Add Song, so song i sits at i + 1 */
     markSongsDirty();
+    updateSongStepLeds();
     renameSong(song);
+}
+
+/* Shift+jog moves the highlighted song through the list - which is also
+ * how it is moved onto a different preset step button, since the first
+ * eight songs ARE the eight buttons in list order. The cursor travels
+ * with the song, so holding Shift and spinning keeps moving the same one
+ * instead of walking off it after the first step. */
+function moveSong(step) {
+    const from = songMgmtCursor - 1;   /* row 0 is "+ Add Song" */
+    if (from < 0) return;
+    const to = from + step;
+    if (to < 0 || to >= songs.length) return;
+    const [song] = songs.splice(from, 1);
+    songs.splice(to, 0, song);
+    songMgmtCursor = to + 1;
+    markSongsDirty();
+    updateSongStepLeds();
 }
 
 function deleteSong(index) {
@@ -1021,6 +1076,7 @@ function deleteSong(index) {
         activePageIndex = 0;
     }
     markSongsDirty();
+    updateSongStepLeds();
 }
 
 function handleSongMgmtInput(data) {
@@ -1046,9 +1102,12 @@ function handleSongMgmtInput(data) {
 
     if (moveControlNumber === moveJogTurn) {
         const delta = decodeDelta(data[2]);
-        if (delta !== 0) {
-            songMgmtCursor = Math.max(0, Math.min(songs.length, songMgmtCursor + Math.sign(delta)));
+        if (delta === 0) return;
+        if (shiftHeld) {
+            moveSong(Math.sign(delta));
+            return;
         }
+        songMgmtCursor = Math.max(0, Math.min(songs.length, songMgmtCursor + Math.sign(delta)));
         return;
     }
 
@@ -1064,7 +1123,7 @@ function handleSongMgmtInput(data) {
         activeSongId = songs[songMgmtCursor - 1].id;
         activePageIndex = 0;
         markSongsDirty();
-        closeSongManagement();
+        closeSongManagement();   /* relights the preset LEDs on the way out */
     } else if (moveControlNumber === moveCAP) {
         createSong();
     } else if (moveControlNumber === moveMENU) {
@@ -1088,7 +1147,7 @@ function drawSongMgmt() {
         getLabel: (item) => item.name,
         getValue: (item) => (item === ADD_SONG_ITEM ? "" : (item.id === activeSongId ? "*" : "")),
     });
-    drawMenuFooter(["Jog: Move", "Click: Select", "Back: Close"]);
+    drawMenuFooter(["Jog: Move", "Shift+Jog: Reorder", "Click: Select"]);
 }
 
 /* ============================================================================
@@ -1120,10 +1179,10 @@ function drawSongMgmt() {
  * "add" is here as well as on an empty slot because a FULL page has no
  * empty slot left to touch - that is the case auto-page-creation exists
  * for, and without a second door it would be unreachable. */
-const KNOB_SETTINGS_FIELDS = ["name", "cc", "mode", "display", "add", "remove"];
+const KNOB_SETTINGS_FIELDS = ["name", "cc", "mode", "display", "move", "add", "remove"];
 const KNOB_SETTINGS_LABELS = {
     name: "Name", cc: "CC", mode: "Mode", display: "Display",
-    add: "Add Knob", remove: "Remove Knob",
+    move: "Slot", add: "Add Knob", remove: "Remove Knob",
 };
 
 let knobEditOpen = false;
@@ -1150,6 +1209,82 @@ function closeKnobEdit() {
     cachedSongId = null;
     queuePadRedraw();
     updateMoveViewPulse();
+}
+
+/* The slots a move operates on: the whole viz group if this knob is in
+ * one, otherwise just this knob.
+ *
+ * A graphic's members have to stay contiguous AND inside one row or
+ * viz.mjs stops forming the group and the picture disappears, so moving a
+ * single member out from under its own graphic is never what was wanted.
+ * The group travels as a block instead. */
+function knobMoveBlock(page, index) {
+    const knob = page.knobs[index];
+    const group = knob && knob.viz ? knob.viz.group : null;
+    if (!group) return { start: index, size: 1 };
+    const slots = [];
+    page.knobs.forEach((k, i) => {
+        if (k && k.viz && k.viz.group === group) slots.push(i);
+    });
+    const start = Math.min(...slots);
+    return { start, size: Math.max(...slots) - start + 1 };
+}
+
+/* Where a block of this size may begin: anywhere it fits within a SINGLE
+ * row. That is viz.mjs's constraint, and it is what makes a four-knob
+ * envelope have exactly two possible homes (the two rows) while a lone
+ * knob can sit anywhere. */
+function validBlockStarts(size) {
+    const out = [];
+    for (let base = 0; base < KNOBS_PER_PAGE; base += KNOBS_PER_ROW) {
+        for (let start = base; start + size <= base + KNOBS_PER_ROW; start++) out.push(start);
+    }
+    return out;
+}
+
+/* Move the edited knob - or its whole graphic - to the next valid
+ * position, swapping with whatever is in the way so nothing is displaced
+ * off the page. Within the current page only: a slot IS a physical
+ * encoder, and moving a knob to a page you are not looking at would put
+ * it under no encoder at all. Knobs keep their names, CCs and values;
+ * only their positions change.
+ *
+ * Because the step is "next VALID start" rather than "one slot", a block
+ * that cannot slide within its row jumps to the other row instead - which
+ * is the only way a four-knob envelope can be moved at all. */
+function moveKnobSlot(step) {
+    const page = getActivePage();
+    if (!page) return;
+    const knobs = page.knobs;
+    const { start, size } = knobMoveBlock(page, knobEditIndex);
+
+    const starts = validBlockStarts(size);
+    const target = starts[starts.indexOf(start) + step];
+    if (target === undefined) return;
+
+    const moving = knobs.slice(start, start + size);
+    /* Whatever occupies the destination and is not part of the block
+     * itself comes back to fill the slots the block vacates. The two
+     * counts always match, so no knob is created or lost: a step within a
+     * row rotates its neighbour around, and a jump to the other row swaps
+     * the two blocks whole. */
+    const displaced = [];
+    for (let i = target; i < target + size; i++) {
+        if (i >= start && i < start + size) continue;
+        if (knobs[i]) displaced.push(knobs[i]);
+    }
+    const freed = [];
+    for (let i = start; i < start + size; i++) {
+        if (i < target || i >= target + size) freed.push(i);
+    }
+
+    for (let i = start; i < start + size; i++) knobs[i] = null;
+    for (let i = target; i < target + size; i++) knobs[i] = null;
+    moving.forEach((k, i) => { knobs[target + i] = k; });
+    displaced.forEach((k, i) => { if (freed[i] !== undefined) knobs[freed[i]] = k; });
+
+    knobEditIndex += target - start;   /* keep editing the knob, not the slot */
+    cachedSongId = null;               /* slot -> key mapping changed */
 }
 
 function renameKnob(knob) {
@@ -1217,6 +1352,8 @@ function handleKnobEditInput(data) {
             knob.mode = Math.max(0, Math.min(KNOB_MODE_OPTIONS.length - 1, knob.mode + Math.sign(delta)));
         } else if (field === "display") {
             knob.display = Math.max(0, Math.min(KNOB_DISPLAY_OPTIONS.length - 1, knob.display + Math.sign(delta)));
+        } else if (field === "move") {
+            moveKnobSlot(Math.sign(delta));
         }
         markSongsDirty();
         return;
@@ -1277,6 +1414,14 @@ function drawKnobEdit() {
             if (field === "cc") return String(knob.cc);
             if (field === "mode") return KNOB_MODE_OPTIONS[knob.mode];
             if (field === "display") return KNOB_DISPLAY_OPTIONS[knob.display];
+            if (field === "move") {
+                /* A range when a graphic moves as one, so the row says
+                 * that the whole picture travels rather than this knob. */
+                const block = knobMoveBlock(page, knobEditIndex);
+                return block.size > 1
+                    ? `${block.start + 1}-${block.start + block.size}`
+                    : String(knobEditIndex + 1);
+            }
             return "";
         },
     });
@@ -2107,14 +2252,19 @@ globalThis.onMidiMessageInternal = function (data) {
         let lppNote = activeMoveToLppPadMap.get(moveNoteNumber);
 
         if (!lppNote) {
+            /* The odd step notes are the song preset buttons - see
+             * SONG_STEP_NOTES. They are not part of the LPP grid (only the
+             * even steps, 16-30, are), so M8 never sees them. */
+            const presetIndex = SONG_STEP_NOTES.indexOf(moveNoteNumber);
+            if (presetIndex >= 0) {
+                if (data[2] === 127) selectSongByStep(presetIndex);
+                return;
+            }
+
             /* Shift+touch a song knob (notes 0-7; note 8 is the master knob,
              * which has no name/CC of its own to edit) opens Knob Edit. A
              * plain touch instead claims it for the title-row value readout
-             * (see isKnobReadoutActive) until release. Otherwise knob touch
-             * and the odd step notes (17-31, formerly bank/save-slot select)
-             * have no purpose here - they're not part of the LPP grid either
-             * (only the even steps, 16-30, are - see
-             * lppPadToMovePadMapTop/Bottom). */
+             * (see isKnobReadoutActive) until release. */
             if (moveNoteNumber >= 0 && moveNoteNumber <= 7) {
                 if (shiftHeld && data[2] === 127) {
                     /* Shift+touch a FILLED slot edits that knob; an EMPTY
