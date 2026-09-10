@@ -13,6 +13,7 @@ import {
     MovePad32, MidiClock
 } from '/data/UserData/schwung/shared/constants.mjs';
 import { loadConfig, updateConfig, handleMoveKnobs, changeBank, changeSave, setDisplayMessage } from "./virtual_knobs.mjs";
+import { setButtonLED } from '/data/UserData/schwung/shared/input_filter.mjs';
 
 /* LPP note layout (10x10 grid) */
 const lppNotes = [
@@ -162,29 +163,57 @@ function arraysAreEqual(array1, array2) {
     return true;
 }
 
-function updateMovePadsToMatchLpp() {
+/* Progressive resync of the pad grid after a view toggle. Replaying the whole
+ * active map synchronously can emit up to ~80 packets from one MIDI callback
+ * (40 pads, some doubled); this spreads it across ticks instead, matching the
+ * host's recommended progressive-LED pattern (8/frame). */
+let padRedrawEntries = null;
+let padRedrawIndex = 0;
+const PAD_REDRAW_PER_FRAME = 8;
+
+function queuePadRedraw() {
     let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
-    for (let [movePad, lppPad] of activeMoveToLppPadMap.entries()) {
-        let data = lppNoteValueMap.get(lppPad);
-        if (data) globalThis.onMidiMessageExternal(data);
+    padRedrawEntries = [...activeMoveToLppPadMap.entries()];
+    padRedrawIndex = 0;
+}
+
+function drainPadRedraw() {
+    if (!padRedrawEntries || padRedrawIndex >= padRedrawEntries.length) return;
+    const end = Math.min(padRedrawIndex + PAD_REDRAW_PER_FRAME, padRedrawEntries.length);
+    for (let i = padRedrawIndex; i < end; i++) {
+        const [moveNote, lppNote] = padRedrawEntries[i];
+        const data = lppNoteValueMap.get(lppNote);
+        if (data && data[0] !== 0) {
+            globalThis.onMidiMessageExternal(data);
+        } else {
+            /* M8 has never reported a color for this LPP note under the new
+             * view (still the initial [0,0,0] placeholder) - replaying that
+             * is a no-op, which is what left the OTHER view's stale color
+             * lit on this physical pad. Clear it explicitly instead. */
+            move_midi_internal_send([0x09, 0x90, moveNote, black]);
+        }
     }
+    padRedrawIndex = end;
 }
 
 function updateMoveViewPulse() {
-    move_midi_internal_send([0x0b, 0xB0, moveBACK, dim_grey]);
-    move_midi_internal_send([0x0b, 0xB0, moveMENU, dim_grey]);
-    move_midi_internal_send([0x0b, 0xB0, moveCAP, dim_grey]);
-    move_midi_internal_send([0x0b, 0xB0, currentView, light_grey]);
+    setButtonLED(moveBACK, dim_grey);
+    setButtonLED(moveMENU, dim_grey);
+    setButtonLED(moveCAP, dim_grey);
+    setButtonLED(currentView, light_grey);
     if (!showingTop) {
+        /* Deliberate channel-10 marker distinct from the shared helper's
+         * channel-0 writes - left as a raw send pending hardware
+         * verification (see audit notes on LED channel usage). */
         move_midi_internal_send([0x0b, 0xBA, currentView, black]);
     }
 }
 
 function updatePLAYLed() {
-    if (!liveMode && !isPlaying) move_midi_internal_send([0x0b, 0xB0, movePLAY, light_grey]);
-    if (!liveMode && isPlaying) move_midi_internal_send([0x0b, 0xB0, movePLAY, green]);
-    if (liveMode && !isPlaying) move_midi_internal_send([0x0b, 0xB0, movePLAY, sky]);
-    if (liveMode && isPlaying) move_midi_internal_send([0x0b, 0xB0, movePLAY, navy]);
+    if (!liveMode && !isPlaying) setButtonLED(movePLAY, light_grey);
+    if (!liveMode && isPlaying) setButtonLED(movePLAY, green);
+    if (liveMode && !isPlaying) setButtonLED(movePLAY, sky);
+    if (liveMode && isPlaying) setButtonLED(movePLAY, navy);
 }
 
 function sendLPPIdentity() {
@@ -279,14 +308,17 @@ globalThis.onMidiMessageExternal = function (data) {
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
     if (moveNoteNumber) {
-        if (value === 0x91 && moveVelocity != 0) {
-            move_midi_internal_send([0x09, 0x9f, moveNoteNumber, moveVelocity]);
-        } else {
-            move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
-            if (value === 0x92 && moveVelocity != 0) {
-                move_midi_internal_send([0x09, 0x9a, moveNoteNumber, light_grey]);
-            }
-        }
+        /* Always relay as a plain static (channel 0) write. Move's per-note
+         * Blink2th/Pulse2th animation (channels 15/10) is self-sustaining once
+         * armed - it keeps animating with no further MIDI needed - but M8 does
+         * not reliably send a follow-up for a note once it stops being
+         * relevant (confirmed: pads stayed lit through 2+ minutes with zero
+         * MIDI traffic for that note). Arming it is what leaves pads stuck
+         * flashing indefinitely. M8 already creates its own pulse/flash look
+         * by periodically resending the note with alternating velocity, so a
+         * plain relay reproduces that and correctly goes static the moment M8
+         * stops updating the note - nothing left running on its own to get stuck. */
+        move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
         return;
     }
 
@@ -332,7 +364,7 @@ globalThis.onMidiMessageInternal = function (data) {
         /* Wheel touch toggles top/bottom view */
         if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
             showingTop = !showingTop;
-            updateMovePadsToMatchLpp();
+            queuePadRedraw();
             updateMoveViewPulse();
             return;
         }
@@ -340,7 +372,7 @@ globalThis.onMidiMessageInternal = function (data) {
         if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
             if (!wheelClicked) {
                 showingTop = !showingTop;
-                updateMovePadsToMatchLpp();
+                queuePadRedraw();
                 updateMoveViewPulse();
             }
             wheelClicked = false;
@@ -420,6 +452,19 @@ globalThis.onMidiMessageInternal = function (data) {
 
 globalThis.init = function () {
     console.log("M8 LPP Emulator module starting...");
+
+    /* The master/volume knob is remapped to the "Main" slot of knob bank 8
+     * (see virtual_knobs.mjs) rather than left as real volume. Without this,
+     * Move processes CC 79 / master-touch note 8 in parallel - changing the
+     * actual output volume and popping up Move's own volume OLED overlay -
+     * while the module is showing that same knob turn as an M8 parameter.
+     * No matching call on exit: the host clears this automatically on any
+     * overtake-mode change, and this module has no exit path of its own
+     * (Shift+Vol+Jog-Click is handled entirely at the host level). */
+    if (typeof shadow_set_overtake_suppress_master_volume === 'function') {
+        shadow_set_overtake_suppress_master_volume(1);
+    }
+
     setDisplayMessage(displayMessage);  // Pass displayMessage to virtual_knobs
     displayMessage("M8 LPP Emulator", "Waiting for M8", "to connect", "");
     loadConfig();
@@ -442,5 +487,6 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
+    drainPadRedraw();
     drawUI();
 };

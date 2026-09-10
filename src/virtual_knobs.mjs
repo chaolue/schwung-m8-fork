@@ -1,4 +1,5 @@
 import * as std from "std";
+import { MidiNoteOn, MidiCC, Pulse4th, Trans24th } from '/data/UserData/schwung/shared/constants.mjs';
 
 /* displayMessage is passed in from ui.js to avoid circular import issues */
 let _displayMessage = null;
@@ -222,25 +223,31 @@ function clamp(value, min, max) {
     return value;
 }
 
+const MODULE_DIR = "/data/UserData/schwung/modules/overtake/m8";
+const KNOB_CONFIG_PATH = MODULE_DIR + "/knobconfig.json";
+
 export function loadConfig() {
-    var f, fname = "/data/UserData/schwung-data/m8knobconfig.json";
-    let config = std.loadFile(fname);
+    let config = std.loadFile(KNOB_CONFIG_PATH);
 
     if (config) {
-        f = std.loadFile(fname);
-        let configBanks = std.parseExtJSON(f);
+        let configBanks = std.parseExtJSON(config);
         saveBanks = configBanks;
     }
 }
 
 export function saveConfig() {
-    var f, fname = "/data/UserData/schwung-data/m8knobconfig.json";
-
-    f = std.open(fname, "w");
+    /* std.open() returns null (not a thrown error) on failure, and this runs
+     * from onMidiMessageInternal (Shift+Step) - an uncaught exception there
+     * is fatal to the whole overtake module, not just this save. */
+    const f = std.open(KNOB_CONFIG_PATH, "w");
+    if (!f) {
+        console.log(`saveConfig: failed to open ${KNOB_CONFIG_PATH} for writing`);
+        return;
+    }
     f.puts(JSON.stringify(saveBanks));
     f.close();
 
-    let str = std.loadFile(fname);
+    let str = std.loadFile(KNOB_CONFIG_PATH);
     console.log(`Config Content: ${str}`);
 }
 
@@ -259,7 +266,7 @@ function setKnobLed(moveControlNumber, value) {
     const color = getColorForKnobValue(value);
     if (knobLEDs[moveControlNumber] === color) return;
     if (moveControlNumber === 79) moveControlNumber = 118; // record audio led for main vol
-    move_midi_internal_send([0 << 4 | 0xb, 0xb1 | 0, moveControlNumber, color]);
+    move_midi_internal_send([0 << 4 | (MidiCC + Trans24th) >> 4, MidiCC + Trans24th, moveControlNumber, color]);
     knobLEDs[moveControlNumber] = color;
 }
 
@@ -268,12 +275,12 @@ export function changeSave(index = 0) {
     saveConfig();
 
     // stop flashing old saved bank LED
-    move_midi_internal_send([0 << 4 | 0x9, 0x91 | 0, (currentSave*2)+17, black]);
+    move_midi_internal_send([0 << 4 | (MidiNoteOn + Trans24th) >> 4, MidiNoteOn + Trans24th, (currentSave*2)+17, black]);
 
     currentSave = index;
 
     // flash saved bank LED
-    move_midi_internal_send([0 << 4 | 0x99/16, 0x99 | 0, (index*2)+17, red]);
+    move_midi_internal_send([0 << 4 | (MidiNoteOn + Pulse4th) >> 4, MidiNoteOn + Pulse4th, (index*2)+17, red]);
 
     changeBank(currentBank);
 }
@@ -284,7 +291,7 @@ export function changeBank(index = 0) {
     currentBank = index;
 
     // turn off old bank LED
-    move_midi_internal_send([0 << 4 | 0x9, 0x91 | 0, bank.led, black]);
+    move_midi_internal_send([0 << 4 | (MidiNoteOn + Trans24th) >> 4, MidiNoteOn + Trans24th, bank.led, black]);
 
     // toggle bank to show main volume bank (8)
     if (index === bank.bank) {
@@ -294,7 +301,7 @@ export function changeBank(index = 0) {
     updateConfig();
 
     // set bank LED
-    move_midi_internal_send([0 << 4 | 0x9, 0x91 | 0, bank.led, white]);
+    move_midi_internal_send([0 << 4 | (MidiNoteOn + Trans24th) >> 4, MidiNoteOn + Trans24th, bank.led, white]);
 }
 
 
