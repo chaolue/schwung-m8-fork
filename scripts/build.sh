@@ -18,7 +18,6 @@ echo "Packaging..."
 cp src/module.json dist/m8/
 [ -f src/help.json ] && cp src/help.json dist/m8/
 cp src/ui.js dist/m8/
-cp src/virtual_knobs.mjs dist/m8/
 
 # Create tarball for release
 cd dist
