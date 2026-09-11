@@ -766,27 +766,27 @@ function filterEntry(types) {
              * their defaults and either one squeezes the band from its
              * own side.
              *
-             * HIGHPASS FIRST, by request, which is the opposite of the
-             * order the M8 lists these in (CUT above RES). That is a
-             * deliberate choice and it has a cost worth knowing: M8
-             * mapping is a LEARN system, so walking down the M8's screen
-             * assigning each row to the next knob puts CUT on the knob
-             * labelled HP and crosses the pair. The sound then follows
-             * CUT while the picture moves the highpass corner, which
-             * looks exactly like a drawing bug and is not one.
+             * LOWPASS FIRST, which is the M8's own parameter order
+             * (it lists CUT above RES). M8 mapping is a LEARN system,
+             * so the natural gesture is to walk down the M8's screen
+             * assigning each row to the next knob - and in this order
+             * that lands each knob on the parameter its label claims.
              *
-             * So the first knob must be learned to RES and the second to
-             * CUT. These are the only two knobs in the catalogue whose
-             * label NAMES the M8 parameter as well as the role, because
-             * they are the only two where the label and the parameter
-             * are different words and getting the pair round the wrong
-             * way is silent: it looks like the picture is mirrored, not
-             * like a mapping mistake. Touch the knob and the header
-             * reads "Ins02 HP (RES)", which is the answer at the moment
-             * you need it. */
+             * The pair was HP-first for a while, by request, and it is
+             * worth recording why it came back: reversed, the natural
+             * learn gesture CROSSES the two, and a crossed pair is
+             * indistinguishable from a mirrored graphic. Three rounds
+             * went on proving the drawing innocent. The order that
+             * cannot be crossed by the obvious gesture wins over the
+             * one that reads more tidily.
+             *
+             * The labels name the M8 parameter as well as the role -
+             * the only two in the catalogue that do - so the header
+             * reads "Ins02 LP (CUT)" and the mapping is unambiguous at
+             * the moment you make it. */
             [FILTER_LP_HP]: [
-                { m: "HP", label: "Highpass (RES)", def: 0x00, role: "resonance" },
                 { m: "LP", label: "Lowpass (CUT)", def: 0xFF, role: "cutoff" },
+                { m: "HP", label: "Highpass (RES)", def: 0x00, role: "resonance" },
             ],
         },
         knobs: [
