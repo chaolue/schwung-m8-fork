@@ -20,7 +20,9 @@ import {
     renderPage, centeredText, fitText, SCREEN_WIDTH, COLS
 } from '/data/UserData/schwung/shared/param_pages/render_page.mjs';
 import { resolveViz } from '/data/UserData/schwung/shared/param_pages/viz.mjs';
-import { lfoShapeSample } from '/data/UserData/schwung/shared/param_pages/viz_draw.mjs';
+import {
+    lfoShapeSample, filterGainAt
+} from '/data/UserData/schwung/shared/param_pages/viz_draw.mjs';
 import {
     drawMenuList, drawMenuHeader, drawMenuFooter, drawStatusOverlay
 } from '/data/UserData/schwung/shared/menu_layout.mjs';
@@ -630,12 +632,16 @@ function libraryDrawsShape(id) {
     return [0.1, 0.35].some((t) => lfoShapeSample(id, t) !== lfoShapeSample(0, t));
 }
 
-const VIZ_UNSUPPORTED_MODES = [
-    /* A lowpass corner and a highpass corner, with no resonance - see the
-     * note above. Nothing in viz_draw's filter vocabulary describes it,
-     * and unlike the LFO shapes below there is no id to probe for. */
-    "LP>HP",
-].concat(
+/* LP>HP is probed the same way, just through the filter model rather
+ * than the LFO one: an older Schwung has no such mode and falls through
+ * to its lowpass default, so a response that differs from a lowpass is
+ * the answer. The probe point sits below the highpass corner, where the
+ * two disagree most - a lowpass passes it and LP>HP stops it. */
+function libraryDrawsLpHp() {
+    return filterGainAt(0.2, "lphp", 0.8, 0.5) !== filterGainAt(0.2, "lp", 0.8, 0.5);
+}
+
+const VIZ_UNSUPPORTED_MODES = (libraryDrawsLpHp() ? [] : ["LP>HP"]).concat(
     /* An exponential drawn as a ramp is the wrong curve, and SQU UP drawn
      * as the only square would be inverted - showing the LFO high exactly
      * when it is low. So on a host that cannot draw them, they get plain
