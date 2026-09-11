@@ -670,6 +670,83 @@ the same change:
 The `Slot` row reports a range (`1-3`) when a graphic will travel, so the
 row says the whole picture moves rather than this one knob.
 
+**Round 14: a Settings menu, global settings, odd-rows view, and why Line
+In is advice.**
+
+Shift+jog-click now opens **Settings**, with the song list as its first
+row rather than being the whole screen. Same row idiom as Knob Settings -
+jog moves, click enters a value row, jog changes it, click leaves - so
+there is one way to edit a value in this module rather than two. Back
+means "up one" everywhere; picking a song is the deliberate exception
+that leaves the menus entirely, because you asked to go and play it.
+
+Settings are **global**, stored beside the songs in `songs.json` and
+merged over `DEFAULT_SETTINGS` on load so a file written before a setting
+existed still loads. They describe how the module talks to the M8, not
+what a song contains - a setting that changed under you when a preset
+button switched song would be a nasty surprise.
+
+- `Knob Chan` - the channel the eight song knobs send on (was a hardcoded
+  `SONG_KNOB_MIDI_CHANNEL = 3`). Must match M8's CONTROL MAP CHANNEL.
+- `Master CC` / `Mstr Chan` / `Mstr Mode` - the master knob gets its own
+  CC, channel and absolute/relative send rather than borrowing the knobs'.
+- `Odd Rows` - see below.
+- `Line In` - opens a page of advice, not a switch.
+
+### The wheel gesture was a PEEK, and a third view exposed that
+
+Touch-and-release toggled the view twice, which with two views meant
+"show the other one while I hold, then put it back" - a peek, committed
+by clicking while still touching. Nobody had to notice, because with two
+views "advance" and "put it back" are the same operation. With three they
+are not, and cycling twice would SKIP a view instead of returning.
+
+So the view is remembered on touch and restored on release unless a click
+committed it, and a further click while still touching advances again -
+which is how the third view is reached in one gesture. The view button
+shows which you are on: steady for Top, a pulse for Bottom, a faster
+blink for Odd (the animation is the channel nibble of the status byte -
+0xA is Pulse2th, 0xD is Blink8th).
+
+**Odd rows** (rows 1,3,5,7; M8 calls them 00,02,04,06) needed a third pad
+map and a third CONTROL map - the four track buttons are the right-hand
+LPP column of whichever four rows are showing, which is the only thing
+that differs between the existing two. Off by default, so anyone who does
+not want a third stop never gets one. Turning it off while it is the view
+on screen moves you back to Top, or the pads would be left on a layout
+the cycle can no longer reach. Idea and behaviour from the "display only
+odd rows" mode in damian-/move-anything.
+
+### Line In: not possible from JS in Schwung, and already solved
+
+The pre-Schwung version of this module did it by writing samples straight
+into the SPI mmap - reading audio in at offset 2304 and writing audio out
+at 256. **Schwung exposes no JS binding for either** (checked by
+enumerating every registered binding, not by reading the docs): audio
+moved into the shim and into native DSPs. Even with a binding, writing
+there would fight the shim, which is already compositing shadow audio,
+Master FX, sends and master volume into that same buffer.
+
+Schwung also already ships the feature properly - `linein` is a bundled,
+chainable sound generator with input conditioning, a noise gate, HPF and
+a safety limiter, and Schwung's feedback protection watches modules
+declaring `audio_in` specifically, force-bypassing them at boot and when
+headphones are unplugged. Building a second, unguarded one inside this
+module is exactly the interference the feature request was worried about.
+So the row points at that instead, with the feedback warning.
+
+### Two testing notes
+
+`node --check` passed a **use-before-declaration** again - `DEFAULT_SETTINGS`
+referenced `KNOB_MODE_ABSOLUTE` from above its declaration, a
+temporal-dead-zone ReferenceError that is fatal on load and invisible to a
+syntax check. Second time this exact class has appeared; the harness
+caught it both times because it actually imports the module.
+
+And the harness's own `tick()` calls `resetLogs()`, which clears the MIDI
+buffer - so a test must never tick between a gesture and the assertion
+that reads what that gesture sent. Cost a confusing debugging round.
+
 ## Decisions made so far
 
 - **Song list is open-ended**: create / rename / delete, not a fixed count.

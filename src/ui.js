@@ -16,8 +16,11 @@ import {
 } from '/data/UserData/schwung/shared/constants.mjs';
 import { setLED, setButtonLED, decodeDelta } from '/data/UserData/schwung/shared/input_filter.mjs';
 import { buildMetaIndex } from '/data/UserData/schwung/shared/param_pages/param_meta.mjs';
-import { renderPage, centeredText, SCREEN_WIDTH, COLS } from '/data/UserData/schwung/shared/param_pages/render_page.mjs';
+import {
+    renderPage, centeredText, fitText, SCREEN_WIDTH, COLS
+} from '/data/UserData/schwung/shared/param_pages/render_page.mjs';
 import { resolveViz } from '/data/UserData/schwung/shared/param_pages/viz.mjs';
+import { lfoShapeSample } from '/data/UserData/schwung/shared/param_pages/viz_draw.mjs';
 import {
     drawMenuList, drawMenuHeader, drawMenuFooter, drawStatusOverlay
 } from '/data/UserData/schwung/shared/menu_layout.mjs';
@@ -64,6 +67,19 @@ const moveControlToLppNoteMapBottom = new Map([
 
 const lppNoteToMoveControlMapBottom = new Map([...moveControlToLppNoteMapBottom.entries()].map((a) => [a[1], a[0]]));
 
+/* Move control to LPP note mapping (odd-rows view). Identical to the
+ * other two except for the four track buttons, which are the right-hand
+ * column of whichever four rows are on screen - here rows 8, 6, 4, 2. */
+const moveControlToLppNoteMapOdd = new Map([
+    [55, 80], [54, 70], [62, 91], [63, 92], [85, 20],
+    [43, 89], [42, 69], [41, 49], [40, 29],
+    [50, 94], [49, 90], [119, 60], [51, 93], [52, 97],
+    [88, 2], [56, 1], [86, 10], [60, 50], [58, 3],
+    [118, 98], [99, 99]
+]);
+
+const lppNoteToMoveControlMapOdd = new Map([...moveControlToLppNoteMapOdd.entries()].map((a) => [a[1], a[0]]));
+
 /* LPP pad to Move pad mapping (top view) */
 const lppPadToMovePadMapTop = new Map([
     [81, 92], [82, 93], [83, 94], [84, 95], [85, 96], [86, 97], [87, 98], [88, 99],
@@ -85,6 +101,28 @@ const lppPadToMovePadMapBottom = new Map([
 ]);
 
 const moveToLppPadMapBottom = new Map([...lppPadToMovePadMapBottom.entries()].map((a) => [a[1], a[0]]));
+
+/* LPP pad to Move pad mapping (odd-rows view).
+ *
+ * LPP rows 8, 6, 4 and 2 instead of a contiguous four, so a 4-row Move
+ * screen covers the whole 8-row phrase at half resolution. Ported from
+ * the "display only odd rows" mode in damian-/move-anything.
+ *
+ * WHICH FOUR ROWS IS EASY TO GET WRONG BY ONE. LPP row 8 (81-88) is the
+ * TOP row - the Top view maps it to Move pad 92, Move's top left - so
+ * M8's rows 00, 02, 04, 06 are LPP 8, 6, 4, 2, NOT 7, 5, 3, 1. The first
+ * version used the odd LPP numbers, which reads plausibly and silently
+ * shows M8 rows 01/03/05/07 instead: every row present but the first one
+ * missing. */
+const lppPadToMovePadMapOdd = new Map([
+    [81, 92], [82, 93], [83, 94], [84, 95], [85, 96], [86, 97], [87, 98], [88, 99],
+    [61, 84], [62, 85], [63, 86], [64, 87], [65, 88], [66, 89], [67, 90], [68, 91],
+    [41, 76], [42, 77], [43, 78], [44, 79], [45, 80], [46, 81], [47, 82], [48, 83],
+    [21, 68], [22, 69], [23, 70], [24, 71], [25, 72], [26, 73], [27, 74], [28, 75],
+    [101, 16], [102, 18], [103, 20], [104, 22], [105, 24], [106, 26], [107, 28], [108, 30]
+]);
+
+const moveToLppPadMapOdd = new Map([...lppPadToMovePadMapOdd.entries()].map((a) => [a[1], a[0]]));
 
 /* M8-specific colors for LPP color translation */
 const light_grey = 0x7c;
@@ -129,7 +167,53 @@ const lppColorToMoveMonoMap = new Map([
 ]);
 
 /* State */
-let showingTop = true;
+/* Which four LPP rows the pads show. Top and Bottom have always been a
+ * pair toggled by wheel touch; Odd is a third stop, added to the cycle
+ * only when the setting is on (see settings.oddRows) so anyone who does
+ * not want a third press never gets one. */
+const VIEW_TOP = 0;
+const VIEW_BOTTOM = 1;
+const VIEW_ODD = 2;
+let viewMode = VIEW_TOP;
+
+function padMapLppToMove() {
+    if (viewMode === VIEW_ODD) return lppPadToMovePadMapOdd;
+    return viewMode === VIEW_TOP ? lppPadToMovePadMapTop : lppPadToMovePadMapBottom;
+}
+function padMapMoveToLpp() {
+    if (viewMode === VIEW_ODD) return moveToLppPadMapOdd;
+    return viewMode === VIEW_TOP ? moveToLppPadMapTop : moveToLppPadMapBottom;
+}
+function controlMapLppToMove() {
+    if (viewMode === VIEW_ODD) return lppNoteToMoveControlMapOdd;
+    return viewMode === VIEW_TOP ? lppNoteToMoveControlMapTop : lppNoteToMoveControlMapBottom;
+}
+function controlMapMoveToLpp() {
+    if (viewMode === VIEW_ODD) return moveControlToLppNoteMapOdd;
+    return viewMode === VIEW_TOP ? moveControlToLppNoteMapTop : moveControlToLppNoteMapBottom;
+}
+
+/* Wheel touch is a PEEK, and that is easy to lose sight of: touching
+ * advances the view, releasing puts it back, and a CLICK while still
+ * touching is what commits. With two views "put it back" and "advance"
+ * were the same operation, so the original code just toggled twice and
+ * nobody had to notice; with three they are different, and toggling
+ * twice would skip a view instead of returning. Hence the remembered
+ * view rather than a second cycle.
+ *
+ * Clicking again without releasing advances again, which is how the
+ * third view is reached in one gesture. */
+let viewBeforePeek = VIEW_TOP;
+
+function viewStops() {
+    return settings.oddRows ? 3 : 2;
+}
+
+function advanceViewMode() {
+    viewMode = (viewMode + 1) % viewStops();
+    queuePadRedraw();
+    updateMoveViewPulse();
+}
 let shiftHeld = false;
 let liveMode = false;
 let isPlaying = false;
@@ -142,6 +226,15 @@ let initRetryTicks = 0;   /* Ticks since startup for retry logic */
 const INIT_RETRY_INTERVAL = 60;  /* Send init every ~1 second if not connected */
 
 function drawUI() {
+    if (settingsOpen && !songMgmtOpen) {
+        try {
+            drawSettings();
+            return;
+        } catch (e) {
+            console.log(`drawSettings: render failed: ${e}`);
+            closeSettings();
+        }
+    }
     if (songMgmtOpen) {
         try {
             drawSongMgmt();
@@ -219,7 +312,7 @@ let padRedrawIndex = 0;
 const PAD_REDRAW_PER_FRAME = 8;
 
 function queuePadRedraw() {
-    let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
+    let activeMoveToLppPadMap = padMapMoveToLpp();
     padRedrawEntries = [...activeMoveToLppPadMap.entries()];
     padRedrawIndex = 0;
 }
@@ -248,11 +341,15 @@ function updateMoveViewPulse() {
     setButtonLED(moveMENU, dim_grey);
     setButtonLED(moveCAP, dim_grey);
     setButtonLED(currentView, light_grey);
-    if (!showingTop) {
-        /* Deliberate channel-10 marker distinct from the shared helper's
-         * channel-0 writes - left as a raw send pending hardware
-         * verification (see audit notes on LED channel usage). */
+    /* Which view you are in, as an animation on the view button: Top is
+     * steady, Bottom pulses, Odd blinks faster. The channel nibble of the
+     * status byte picks the animation (see constants.mjs - 0xA is
+     * Pulse2th, 0xD is Blink8th), which is why these are raw sends rather
+     * than setButtonLED calls: the shared helper writes channel 0. */
+    if (viewMode === VIEW_BOTTOM) {
         move_midi_internal_send([0x0b, 0xBA, currentView, black]);
+    } else if (viewMode === VIEW_ODD) {
+        move_midi_internal_send([0x0b, 0xBD, currentView, black]);
     }
 }
 
@@ -270,12 +367,31 @@ function updateMoveViewPulse() {
  * songs there are and where you are among them. */
 const SONG_STEP_NOTES = [17, 19, 21, 23, 25, 27, 29, 31];
 
-function updateSongStepLeds() {
+function updateSongStepLeds(force) {
     SONG_STEP_NOTES.forEach((note, i) => {
         const song = songs[i];
-        if (!song) { setLED(note, black); return; }
-        setLED(note, song.id === activeSongId ? white : dim_grey);
+        if (!song) { setLED(note, black, force); return; }
+        setLED(note, song.id === activeSongId ? white : dim_grey, force);
     });
+}
+
+/* The host clears every LED about 500ms into the overtake handshake, and
+ * markM8Connected can land on either side of that - M8 is often already
+ * streaming when the module loads, so the first paint happens BEFORE the
+ * clear and is wiped by it. setLED then believes the row is already
+ * correct and never repaints, which is why the preset LEDs came up dark.
+ *
+ * So the row is re-asserted past the cache for the first couple of
+ * seconds, whenever the clear actually lands. INIT_RETRY_INTERVAL treats
+ * 60 ticks as roughly a second, so this is about two. */
+const SONG_STEP_LED_REASSERT_TICKS = 120;
+const SONG_STEP_LED_REASSERT_EVERY = 20;
+let songStepLedReassert = 0;
+
+function tickSongStepLeds() {
+    if (songStepLedReassert <= 0) return;
+    songStepLedReassert--;
+    if (songStepLedReassert % SONG_STEP_LED_REASSERT_EVERY === 0) updateSongStepLeds(true);
 }
 
 /* Pressing one of those buttons switches song. Silent for a button with
@@ -316,9 +432,10 @@ function markM8Connected() {
     if (m8Connected) return;
     m8Connected = true;
     initRetryTicks = 0;
-    showingTop = true;
+    viewMode = VIEW_TOP;
     loadSongs();
-    updateSongStepLeds();
+    updateSongStepLeds(true);
+    songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
 }
 
 function initLPP() {
@@ -341,6 +458,12 @@ const KNOBS_PER_PAGE = 8;
  * multi-knob graphic may not span the gap between them - see
  * nextFreeKnobRun. */
 const KNOBS_PER_ROW = 4;
+
+/* Module settings: GLOBAL, not per song. These describe how the module
+ * talks to the M8 - which channel and CC it sends on, how the grid is
+ * laid out - rather than anything a song contains, and a setting that
+ * changed under you when a preset button switched song would be a nasty
+ * surprise. Persisted alongside the songs in songs.json. */
 
 let songs = [];             // Song[]
 let activeSongId = null;
@@ -377,11 +500,31 @@ function makeSongId() {
 /* mode/display are stored as plain indices into these option lists (not
  * strings) - the module owns both storage and interpretation, so there's no
  * external wire format to reconcile via param_pages' values[] mapping. */
-const KNOB_MODE_OPTIONS = ["Absolute", "Relative"];
+/* Abbreviated because they are drawn in a LIST's value column, which is
+ * what is left after the label and the label floor: "Absolute" beside
+ * "Mstr Mode" ran off the right edge of the screen. */
+const KNOB_MODE_OPTIONS = ["Abs", "Rel"];
 const KNOB_MODE_ABSOLUTE = 0;
 const KNOB_MODE_RELATIVE = 1;
-const KNOB_DISPLAY_OPTIONS = ["0-127", "Hex"];
+const KNOB_DISPLAY_OPTIONS = ["0-127", "Hex", "0-1", "-1..1"];
 const KNOB_DISPLAY_HEX = 1;
+const KNOB_DISPLAY_UNIT = 2;
+const KNOB_DISPLAY_BIPOLAR = 3;
+
+const DEFAULT_SETTINGS = {
+    /* MIDI channel for the song knobs' CCs, 0-15 on the wire. M8's
+     * CONTROL MAP CHANNEL (MIDI Settings view) has to agree with this or
+     * nothing the knobs send is heard. */
+    knobChannel: 3,
+    /* The master knob is a song-independent pass-through, so it gets its
+     * own channel, CC and send mode rather than borrowing the knobs'. */
+    masterChannel: 3,
+    masterCc: 79,
+    masterMode: KNOB_MODE_ABSOLUTE,
+    /* Adds a third stop to the wheel-touch view cycle - see ODD_ROWS. */
+    oddRows: false,
+};
+let settings = Object.assign({}, DEFAULT_SETTINGS);
 
 /* ============================================================================
  * M8 parameter catalogue - what the Add Knob wizard offers.
@@ -428,6 +571,88 @@ const KNOB_DISPLAY_HEX = 1;
  *   0x00  everything else - sends, resonance, amp, modulation amounts and
  *         the enum-ish selectors, all starting at their first/least value
  * ============================================================================ */
+
+/* The filter's two knobs, as one entry. Stated once because Wavsynth
+ * carries a longer type list and would otherwise be a second copy.
+ *
+ * `modeNames` renames the knobs for a type whose two controls are not
+ * cutoff and resonance: M8's LP>HP is a lowpass corner and a HIGHPASS
+ * corner, so calling them CUT and RES is simply wrong - and naming a
+ * second pair CUT2/RES2 on the same page also collides with an ordinary
+ * filter's, which makes render_page disambiguate them by appending the
+ * slot number ("CUT24"). Right names, no collision. */
+function filterEntry(types) {
+    return {
+        /* Just "Filter": drawMenuList budgets a fixed ~6px per glyph for
+         * a label and then truncates, so "Filter (2 knobs)" was cut
+         * mid-word. The count is already in the value column
+         * (entryPreview renders it as "2kn"), which is where it belongs. */
+        label: "Filter",
+        vizKind: "filter",
+        vizModeRole: "mode",
+        vizModeOptions: types,
+        vizModePrompt: "Filter Type",
+        modeNames: { "LP>HP": ["LP", "HP"] },
+        knobs: [
+            { m: "CUT", def: 0xFF, role: "cutoff" },
+            { m: "RES", def: 0x00, role: "resonance" },
+        ],
+    };
+}
+
+/* Settings the shared viz layer cannot draw honestly, so no graphic is
+ * formed for them and their knobs stay ordinary dials.
+ *
+ * M8's LP>HP is a lowpass whose RES sets the corner of a one-pole
+ * HIGHPASS - two independent corners, and no resonance at all.
+ * viz_draw's filterModeOf maps any name containing both "lp" and "hp" to
+ * its BANDPASS, and that bandpass is a single hump centred on CUTOFF
+ * which narrows and grows a peak as resonance rises: the wrong corner,
+ * the wrong behaviour, and a resonant peak the filter does not have.
+ *
+ * Drawing it correctly needs a mode in viz_draw's own vocabulary - its
+ * curve helpers (fillCurveMass, drawColumnCurve, PASS, EDGE) are all
+ * module-private, and that file explicitly forbids a graph keeping its
+ * own copy of the fill, because a filter that fills differently from the
+ * envelope beside it can misrepresent the filter. Until such a mode
+ * exists, no picture beats a wrong one. */
+/* Shape ids for the three waveforms Schwung gained for M8's sake (see
+ * the viz-lfo-exponential-and-square-up branch). An OLDER Schwung has no
+ * case for them and lfoShapeSample falls through to its sine default, so
+ * sampling one against a sine is a reliable way to ask whether this
+ * host can draw it - and cheaper than shipping two builds of the
+ * module or guessing from a version number. */
+const LFO_SHAPE_PROBE = { "EXP DN": 100, "EXP UP": 101, "SQU UP": 102 };
+
+function libraryDrawsShape(id) {
+    /* Two probe points, because a single one can coincide: an inverted
+     * square and a sine happen to agree at phase 0. */
+    return [0.1, 0.35].some((t) => lfoShapeSample(id, t) !== lfoShapeSample(0, t));
+}
+
+const VIZ_UNSUPPORTED_MODES = [
+    /* A lowpass corner and a highpass corner, with no resonance - see the
+     * note above. Nothing in viz_draw's filter vocabulary describes it,
+     * and unlike the LFO shapes below there is no id to probe for. */
+    "LP>HP",
+].concat(
+    /* An exponential drawn as a ramp is the wrong curve, and SQU UP drawn
+     * as the only square would be inverted - showing the LFO high exactly
+     * when it is low. So on a host that cannot draw them, they get plain
+     * dials; on one that can, they get their real waveform. */
+    Object.keys(LFO_SHAPE_PROBE).filter((name) => !libraryDrawsShape(LFO_SHAPE_PROBE[name]))
+);
+
+/* M8's shape names against the ones viz_draw matches on. The picker keeps
+ * M8's own spelling; what gets STORED (and read by the viz layer) is the
+ * right-hand side. "RAMP DN" missing by two letters is why it drew a
+ * sine: lfoShapeIdOf matches whole words and an unrecognised name falls
+ * through to sine rather than failing, so a wrong name is invisible. */
+const M8_LFO_SHAPE_ALIASES = {
+    "RAMP DN": "RAMP DOWN",
+    /* The library's one square starts high, which IS M8's SQU DN. */
+    "SQU DN": "SQUARE",
+};
 
 /* M8's filter types, in the order the Multi-mode Filter Parameters section
  * lists them, plus the OFF the Instrument View screenshot shows as default.
@@ -554,17 +779,7 @@ const M8_INSTRUMENT_GENERIC = [
      * the wizard and stored with the group rather than given a knob of its
      * own, because the type is a selector and so cannot be mapped - see
      * vizModeFor and the span:false role ensureSongPageMeta emits. */
-    {
-        label: "Filter (2 knobs)",
-        vizKind: "filter",
-        vizModeRole: "mode",
-        vizModeOptions: M8_FILTER_TYPES,
-        vizModePrompt: "Filter Type",
-        knobs: [
-            { m: "CUT", def: 0xFF, role: "cutoff" },
-            { m: "RES", def: 0x00, role: "resonance" },
-        ],
-    },
+    filterEntry(M8_FILTER_TYPES),
     { m: "CUT", label: "Cutoff", def: 0xFF },
     { m: "RES", label: "Resonance", def: 0x00 },
     { m: "AMP", label: "Amp", def: 0x00 },
@@ -698,7 +913,7 @@ const M8_MOD_TYPES = [
     modType({
         name: "ADSR Envelope",
         vizKind: "envelope",
-        graphicLabel: "Envelope (4 knobs)",
+        graphicLabel: "Envelope",
         extras: [M8_MOD_AMOUNT],
         shape: [
             { m: "ATK", label: "Attack", def: 0x00, role: "attack" },
@@ -725,7 +940,7 @@ const M8_MOD_TYPES = [
     modType({
         name: "LFO",
         vizKind: "lfo",
-        graphicLabel: "LFO (2 knobs)",
+        graphicLabel: "LFO",
         /* OSC (shape) and TRIG are selectors, so neither can be mapped and
          * neither gets a knob. The wave the graphic draws is asked for once,
          * when the graphic is added, and stored with it. */
@@ -892,11 +1107,18 @@ function addKnobsFromEntry(song, entry, number, target, vizMode) {
      * that fails the adjacency check and draws nothing. */
     const groupId = entry.vizKind ? `g${makeSongId()}` : null;
 
+    /* A type whose controls are not what the entry's default names say -
+     * see filterEntry's modeNames. */
+    const renamed = (entry.modeNames && vizMode) ? entry.modeNames[vizMode] : null;
+    /* Stored in the vocabulary the viz layer matches on, which is not
+     * always the one the picker showed - see M8_LFO_SHAPE_ALIASES. */
+    const storedMode = (vizMode && M8_LFO_SHAPE_ALIASES[vizMode]) || vizMode;
+
     members.forEach((member, i) => {
         const slot = place.slot + i;
         if (slot >= KNOBS_PER_PAGE) return;
         const knob = makeKnobConfig(nextFreeCc(song), {
-            name: m8KnobName(member.m, number),
+            name: m8KnobName(renamed ? renamed[i] || member.m : member.m, number),
             def: member.def,
             scale: member.scale,
             viz: groupId ? { group: groupId, kind: entry.vizKind, role: member.role } : undefined,
@@ -908,12 +1130,30 @@ function addKnobsFromEntry(song, entry, number, target, vizMode) {
          * the answer here. ensureSongPageMeta turns it into a span:false
          * role, which is viz.mjs's own mechanism for a role that lends the
          * graphic a value without occupying one of its cells. */
-        if (i === 0 && groupId && vizMode) knob.vizMode = vizMode;
+        if (i === 0 && groupId && storedMode) knob.vizMode = storedMode;
         page.knobs[slot] = knob;
     });
     activePageIndex = place.pageIndex;
+    ensureSparePage(song);
     markSongsDirty();
     return place;
+}
+
+/* Keep an empty page at the end whenever the last one is full.
+ *
+ * Adding a knob is Shift+touch on an EMPTY SLOT, so a song whose last
+ * page is full has no slot left to touch and the gesture dead-ends -
+ * the Add Knob row in Knob Settings was the only way through, which is
+ * not something anyone finds on their own. A spare page means the
+ * obvious gesture always has somewhere to land: jog past the end and
+ * there is a page of empty slots waiting.
+ *
+ * Only ever ONE spare, and only while the last real page is full, so
+ * this cannot pile up blank pages - removeKnobAt prunes trailing empties
+ * first and then asks for the spare again, which settles either way. */
+function ensureSparePage(song) {
+    const last = song.pages[song.pages.length - 1];
+    if (last && last.knobs.indexOf(null) < 0) song.pages.push(makeSongPage());
 }
 
 /* Empty one slot, then drop any now-empty pages off the END of the song.
@@ -931,7 +1171,11 @@ function removeKnobAt(song, pageIndex, slot) {
            && song.pages[song.pages.length - 1].knobs.every((k) => !k)) {
         song.pages.pop();
     }
+    /* Clamp BEFORE the spare is added, or removing the last knob from a
+     * page lands you on the blank spare rather than on the page that
+     * still has knobs on it. */
     activePageIndex = Math.max(0, Math.min(song.pages.length - 1, activePageIndex));
+    ensureSparePage(song);
     markSongsDirty();
 }
 
@@ -947,6 +1191,10 @@ function loadSongs() {
             } else if (parsed && Array.isArray(parsed.songs)) {
                 songs = parsed.songs;
                 activeSongId = parsed.activeSongId || null;
+                /* Merged over the defaults rather than replacing them, so
+                 * a file written before a setting existed still loads and
+                 * simply takes that setting's default. */
+                settings = Object.assign({}, DEFAULT_SETTINGS, parsed.settings || {});
             }
         } catch (e) {
             /* A malformed songs.json must not crash the module (this runs from
@@ -955,14 +1203,19 @@ function loadSongs() {
             console.log(`loadSongs: failed to parse ${SONGS_PATH}: ${e}`);
         }
     }
-    if (!songs.length) {
-        songs = [makeSong("New Song")];
-        saveSongs();
-    }
+    const invented = !songs.length;
+    if (invented) songs = [makeSong("New Song")];
+    for (const song of songs) ensureSparePage(song);
     if (!activeSongId || !songs.some((s) => s.id === activeSongId)) {
         activeSongId = songs[0].id;
         activePageIndex = 0;
     }
+    /* Written only for a song we just invented, and only AFTER the active
+     * id is resolved. Saving before that point recorded
+     * `activeSongId: null`, which the next load silently repaired - so the
+     * file on a fresh install was wrong from the moment it was created and
+     * nothing ever said so. */
+    if (invented) saveSongs();
     console.log(`loadSongs: ${songs.length} song(s), active="${getActiveSong().name}"`);
 }
 
@@ -972,7 +1225,7 @@ function saveSongs() {
         console.log(`saveSongs: failed to open ${SONGS_PATH} for writing`);
         return;
     }
-    f.puts(JSON.stringify({ activeSongId, songs }));
+    f.puts(JSON.stringify({ activeSongId, settings, songs }));
     f.close();
 }
 
@@ -985,6 +1238,189 @@ function getActivePage() {
     if (!song || !song.pages.length) return null;
     if (activePageIndex >= song.pages.length) activePageIndex = 0;
     return song.pages[activePageIndex];
+}
+
+/* ============================================================================
+ * Settings - Shift+Jog-click opens this, and the song list is one row of
+ * it rather than the whole screen.
+ *
+ * Everything here is GLOBAL (see DEFAULT_SETTINGS): it describes how the
+ * module talks to the M8, not what a song contains. Same row idiom as Knob
+ * Settings - jog moves, click enters a value row and jog then changes it,
+ * click again leaves - so there is one way to edit a value in this module
+ * rather than two.
+ * ============================================================================ */
+
+const SETTINGS_ROWS = [
+    "songs", "knobChannel", "masterCc", "masterChannel", "masterMode",
+    "oddRows", "lineIn",
+];
+const SETTINGS_LABELS = {
+    songs: "Songs",
+    knobChannel: "Knob Chan",
+    masterCc: "Master CC",
+    masterChannel: "Mstr Chan",
+    masterMode: "Mstr Mode",
+    oddRows: "Odd Rows",
+    lineIn: "Line In",
+};
+const ONOFF_OPTIONS = ["Off", "On"];
+
+let settingsOpen = false;
+let settingsCursor = 0;
+let settingsEntered = false;
+/* The Line In row opens a page of text rather than editing anything -
+ * see drawLineInHelp for why it is advice and not a switch. */
+let lineInHelpOpen = false;
+
+function openSettings() {
+    settingsOpen = true;
+    settingsCursor = 0;
+    settingsEntered = false;
+    lineInHelpOpen = false;
+}
+
+function closeSettings() {
+    settingsOpen = false;
+    lineInHelpOpen = false;
+    queuePadRedraw();
+    updateMoveViewPulse();
+    updateSongStepLeds();
+}
+
+function settingsRowValue(row) {
+    switch (row) {
+        case "songs": return String(songs.length);
+        /* Channels are stored 0-15 on the wire and shown 1-16, which is
+         * how M8 (and everything else) numbers them. */
+        case "knobChannel": return String(settings.knobChannel + 1);
+        case "masterChannel": return String(settings.masterChannel + 1);
+        case "masterCc": return String(settings.masterCc);
+        case "masterMode": return KNOB_MODE_OPTIONS[settings.masterMode];
+        case "oddRows": return ONOFF_OPTIONS[settings.oddRows ? 1 : 0];
+        default: return "";
+    }
+}
+
+function adjustSetting(row, step) {
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    switch (row) {
+        case "knobChannel":
+            settings.knobChannel = clamp(settings.knobChannel + step, 0, 15);
+            break;
+        case "masterChannel":
+            settings.masterChannel = clamp(settings.masterChannel + step, 0, 15);
+            break;
+        case "masterCc":
+            settings.masterCc = clamp(settings.masterCc + step, 0, 127);
+            break;
+        case "masterMode":
+            settings.masterMode = clamp(settings.masterMode + step, 0, KNOB_MODE_OPTIONS.length - 1);
+            break;
+        case "oddRows":
+            settings.oddRows = step > 0;
+            /* Turning it off while it is the view being shown would leave
+             * the pads on a layout the cycle can no longer reach. */
+            if (!settings.oddRows && viewMode === VIEW_ODD) {
+                viewMode = VIEW_TOP;
+                queuePadRedraw();
+                updateMoveViewPulse();
+            }
+            break;
+        default:
+            return;
+    }
+    markSongsDirty();
+}
+
+function handleSettingsInput(data) {
+    if (data[0] !== 0xb0) return;
+
+    const moveControlNumber = data[1];
+    const pressed = data[2] === 127;
+
+    if (moveControlNumber === moveSHIFT) {
+        shiftHeld = pressed;
+        return;
+    }
+
+    if (moveControlNumber === moveJogTurn) {
+        const delta = decodeDelta(data[2]);
+        if (delta === 0) return;
+        if (settingsEntered) {
+            adjustSetting(SETTINGS_ROWS[settingsCursor], Math.sign(delta));
+        } else if (!lineInHelpOpen) {
+            settingsCursor = Math.max(0, Math.min(SETTINGS_ROWS.length - 1,
+                                                  settingsCursor + Math.sign(delta)));
+        }
+        return;
+    }
+
+    if (!pressed) return;
+
+    if (moveControlNumber === moveBACK) {
+        if (lineInHelpOpen) { lineInHelpOpen = false; return; }
+        if (settingsEntered) { settingsEntered = false; return; }
+        closeSettings();
+        return;
+    }
+
+    if (moveControlNumber !== moveWHEEL) return;
+
+    const row = SETTINGS_ROWS[settingsCursor];
+    if (lineInHelpOpen) { lineInHelpOpen = false; return; }
+    if (row === "songs") {
+        settingsOpen = false;
+        openSongManagement();
+        return;
+    }
+    if (row === "lineIn") { lineInHelpOpen = true; return; }
+    settingsEntered = !settingsEntered;
+}
+
+function drawSettings() {
+    if (lineInHelpOpen) { drawLineInHelp(); return; }
+    clear_screen();
+    drawMenuHeader("Settings");
+    drawMenuList({
+        items: SETTINGS_ROWS,
+        selectedIndex: settingsCursor,
+        editMode: settingsEntered,
+        getLabel: (row) => SETTINGS_LABELS[row],
+        getValue: (row) => settingsRowValue(row),
+    });
+    drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Close"]);
+}
+
+/* Line In is ADVICE, not a switch.
+ *
+ * Passing the input to the output needs the audio buffers, and Schwung
+ * exposes none of that to JS - audio lives in the shim and in native DSPs
+ * now. The pre-Schwung version of this module did it by writing samples
+ * straight into the SPI mmap, which under Schwung would be writing into a
+ * buffer the shim is already compositing shadow audio, Master FX and
+ * master volume into.
+ *
+ * Schwung also already ships the feature, done properly: the Line In
+ * module is a chainable sound generator with input conditioning, a noise
+ * gate, HPF and a safety limiter, and Schwung's feedback protection
+ * watches it specifically - bypassing it at boot and when headphones are
+ * unplugged. So this row points at that rather than building a second,
+ * unguarded one. */
+function drawLineInHelp() {
+    clear_screen();
+    drawMenuHeader("Line In");
+    /* Five rows is what fits between the header and the footer at a 9px
+     * pitch; more silently ran off the bottom of the 64px screen. */
+    const lines = [
+        "Load Schwung's own",
+        "Line In module in a",
+        "chain slot.",
+        "",
+        "WARNING: can feed back",
+    ];
+    lines.forEach((text, i) => print(4, 12 + i * 9, text, 1));
+    drawMenuFooter(["Back: Close"]);
 }
 
 /* ============================================================================
@@ -1019,6 +1455,11 @@ function openSongManagement() {
 
 function closeSongManagement() {
     songMgmtOpen = false;
+    /* Back to Settings, which is where the list was opened from - Back
+     * means "up one", not "all the way out", the same as everywhere else
+     * in this module. Choosing a song is the exception: it closes the
+     * whole thing, because you asked to go and play that song. */
+    settingsOpen = true;
     /* M8's LED updates kept updating lppNoteValueMap while this screen owned
      * the pads (see onMidiMessageExternal), just without painting them - so
      * the cache may now be ahead of what the pads are actually showing.
@@ -1026,6 +1467,13 @@ function closeSongManagement() {
     queuePadRedraw();
     updateMoveViewPulse();
     updateSongStepLeds();
+}
+
+/* Picking a song is "go and play this", so it leaves the menus entirely
+ * rather than stepping back up to Settings. */
+function closeSongManagementToPerform() {
+    closeSongManagement();
+    settingsOpen = false;
 }
 
 function renameSong(song) {
@@ -1122,8 +1570,9 @@ function handleSongMgmtInput(data) {
         }
         activeSongId = songs[songMgmtCursor - 1].id;
         activePageIndex = 0;
+        cachedSongId = null;     /* different song, different page shape */
         markSongsDirty();
-        closeSongManagement();   /* relights the preset LEDs on the way out */
+        closeSongManagementToPerform();   /* relights the preset LEDs on the way out */
     } else if (moveControlNumber === moveCAP) {
         createSong();
     } else if (moveControlNumber === moveMENU) {
@@ -1613,17 +2062,7 @@ function instrumentFrame(instrument) {
  * else, so its filter entry cannot come from the shared generic list. */
 function typeParamsFor(type) {
     if (!type.filterTypes) return type.params;
-    return [{
-        label: "Filter (2 knobs)",
-        vizKind: "filter",
-        vizModeRole: "mode",
-        vizModeOptions: type.filterTypes,
-        vizModePrompt: "Filter Type",
-        knobs: [
-            { m: "CUT", def: 0xFF, role: "cutoff" },
-            { m: "RES", def: 0x00, role: "resonance" },
-        ],
-    }].concat(type.params);
+    return [filterEntry(type.filterTypes)].concat(type.params);
 }
 
 /* "Other": straight to the keyboard, and the typed text IS the name. */
@@ -1823,11 +2262,21 @@ function ensureSongPageMeta(song, pageIndex, page) {
         groupCounts.set(k.viz.group, (groupCounts.get(k.viz.group) || 0) + 1);
     }
 
+    /* Groups whose fixed setting has no honest picture - see
+     * VIZ_UNSUPPORTED_MODES. Declaring no viz leaves the members as
+     * ordinary labelled dials. */
+    const unsupported = new Set();
+    for (const k of page.knobs) {
+        if (!k || !k.viz || !k.viz.group || !k.vizMode) continue;
+        if (VIZ_UNSUPPORTED_MODES.indexOf(k.vizMode) >= 0) unsupported.add(k.viz.group);
+    }
+
     cachedChainParams = page.knobs.map((k, i) => {
         if (!k) return null;
         const key = `${song.id}:${pageIndex}:${i}`;
         const param = { key, name: k.name, type: "int", min: 0, max: 127, step: 1 };
-        if (k.viz && k.viz.group && groupCounts.get(k.viz.group) >= 2) {
+        if (k.viz && k.viz.group && groupCounts.get(k.viz.group) >= 2
+            && !unsupported.has(k.viz.group)) {
             param.viz = { group: k.viz.group, kind: k.viz.kind, role: k.viz.role };
         }
         return param;
@@ -1850,6 +2299,7 @@ function ensureSongPageMeta(song, pageIndex, page) {
     page.knobs.forEach((k, i) => {
         if (!k || !k.vizMode || !k.viz || !k.viz.group) return;
         if (groupCounts.get(k.viz.group) < 2) return;
+        if (unsupported.has(k.viz.group)) return;
         cachedVizModeParams.push({
             key: `${song.id}:${pageIndex}:${i}:mode`,
             name: "",
@@ -1871,40 +2321,92 @@ function ensureSongPageMeta(song, pageIndex, page) {
     cachedPageIndex = pageIndex;
 }
 
-/* Which of renderPage's recorded print() calls is slot `slot`'s name label.
+/* Where the library draws a cell's name label.
  *
- * Found by POSITION rather than by counting, because counting cannot survive
- * the things that make a slot print nothing: an empty slot draws a tick, and
- * a slot inside a multi-knob graphic is covered by the picture. Both are
- * ordinary now, and either one shifts every index in a "the labels are the
- * last N prints" scheme - silently, into a neighbouring cell.
+ * render_page.mjs derives this from constants it does not export
+ * (HEADER_BLOCK, FONT_H and the row height), so the two baselines are
+ * pinned here instead - and CHECKED: test_graphic_labels asserts that an
+ * ordinary dial's label lands exactly on them, so a change in that file
+ * fails a test rather than quietly putting text in the wrong place.
  *
- * Position needs only the cell grid, which is two EXPORTED constants
- * (SCREEN_WIDTH / COLS), never the private vertical layout: a slot's column
- * fixes the x band its label sits in, and within that band the two rows are
- * simply the smaller and larger y. So the answer is "the row-th print whose
- * x falls in this column, ordered by y". A slot that printed nothing has no
- * candidate and returns null, which is exactly when the readout should be
- * skipped - there is no name on screen to replace.
+ * This replaced a scheme that wrapped `print` and matched the recorded
+ * calls by position. That worked for a labelled cell and could not work
+ * at all for a cell covered by a graphic, which prints nothing - and
+ * those are exactly the cells that now need a label drawn. */
+const CELL_LABEL_Y = [30, 56];
+const CELL_W = SCREEN_WIDTH / COLS;
+
+function slotLabelCentre(slot) {
+    return (slot % KNOBS_PER_ROW) * CELL_W + Math.floor(CELL_W / 2);
+}
+
+function slotLabelBaseline(slot) {
+    return CELL_LABEL_Y[Math.floor(slot / KNOBS_PER_ROW)];
+}
+
+/* Draw one cell's label row: a name, or a value in an inverted pill.
  *
- * THE HEADER IS A PRINT TOO, and it sits at x=1 - inside column 0's band.
- * Left in, it was picked as slot 0's "label": the readout painted over the
- * song name and its background rect ran off the top of the screen (a
- * fill_rect at y=-1, which the device would clip silently and a Node
- * harness catches). It is excluded by being the topmost line on screen -
- * derived from the prints themselves rather than from a hardcoded header
- * height, and safe because a cell label can never share the header's row. */
-function findLabelPrint(labelPrints, slot) {
-    if (!labelPrints.length) return null;
-    const headerY = Math.min(...labelPrints.map((p) => p.y));
-    const cellW = SCREEN_WIDTH / COLS;
-    const col = slot % KNOBS_PER_ROW;
-    const row = Math.floor(slot / KNOBS_PER_ROW);
-    const left = col * cellW;
-    const inColumn = labelPrints
-        .filter((p) => p.y !== headerY && p.x >= left && p.x < left + cellW)
-        .sort((a, b) => a.y - b.y);
-    return inColumn[row] || null;
+ * The full cell width is cleared first whatever is being drawn, because
+ * what is already there may be WIDER than what replaces it - "CUTOFF"
+ * giving way to "E0" would otherwise leave the ends of the old name
+ * showing on either side of the pill.
+ *
+ * The pill itself is only as wide as its text plus a couple of pixels,
+ * rather than the whole cell: a full-width bar reads as a highlighted
+ * row, and what is wanted is a badge around the number. */
+function drawSlotLabel(slot, text, inverted) {
+    const cx = slotLabelCentre(slot);
+    const y = slotLabelBaseline(slot);
+    fill_rect(Math.round(cx - CELL_W / 2), y - 1, CELL_W, LABEL_ROW_H, 0);
+    const fitted = fitText(songPageDrawCtx, text, CELL_W - 2);
+    if (inverted) {
+        const w = text_width(fitted) + 4;
+        fill_rect(Math.round(cx - w / 2), y - 1, w, LABEL_ROW_H, 1);
+    }
+    centeredText(songPageDrawCtx, cx, y, fitted, inverted ? 0 : 1);
+}
+
+/* Holding the jog wheel turns knob moves into an AUDITION: the values
+ * you dial in while it is held are put back when you let go.
+ *
+ * This is the same bargain the wheel already strikes with the pad view -
+ * hold to look, release to undo - so "nothing you do while holding the
+ * wheel sticks" is one rule rather than two.
+ *
+ * The original value is captured lazily, on the first turn of each knob,
+ * so holding the wheel without touching anything costs nothing. Reverting
+ * has to reach M8 as well as the display, and how depends on the knob's
+ * send mode - see revertAuditionedKnobs. */
+let jogWheelHeld = false;
+const auditionedKnobs = new Map();   /* knob object -> value before the audition */
+
+function noteAuditionValue(knob) {
+    if (jogWheelHeld && !auditionedKnobs.has(knob)) auditionedKnobs.set(knob, knob.value);
+}
+
+function revertAuditionedKnobs() {
+    if (!auditionedKnobs.size) return;
+    for (const [knob, original] of auditionedKnobs) {
+        const delta = original - knob.value;
+        knob.value = original;
+        if (delta === 0) continue;
+        if (knob.mode === KNOB_MODE_RELATIVE) {
+            /* Relative knobs send movement, not position, so the revert
+             * is the opposite movement. Move's encoding is 1-63 for
+             * clockwise and 65-127 for anticlockwise (see decodeDelta),
+             * and one message carries the whole correction. */
+            const size = Math.min(63, Math.abs(delta));
+            move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
+                                     knob.cc, delta > 0 ? size : 64 + size]);
+        } else {
+            move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
+                                     knob.cc, knob.value]);
+        }
+    }
+    auditionedKnobs.clear();
+    /* The autosave may well have persisted a mid-audition value already,
+     * so the revert has to be written too. */
+    markSongsDirty();
 }
 
 /* Which song knob (0-7, or -1) reads as "active" right now - its VALUE
@@ -1949,15 +2451,28 @@ function formatKnobReadoutValue(knob) {
         const shown = knob.scale === M8_NOTE_SCALE ? knob.value : knob.value * 2;
         return shown.toString(16).toUpperCase().padStart(2, "0");
     }
+    /* The normalised readings work off the CC range the knob actually
+     * travels (0-127), not M8's byte range, so they are the same whether
+     * or not the parameter is note-scaled. */
+    if (knob.display === KNOB_DISPLAY_UNIT) {
+        return (knob.value / 127).toFixed(2);
+    }
+    if (knob.display === KNOB_DISPLAY_BIPOLAR) {
+        /* Centred on 64, because that is the CC that lands on M8's own
+         * centre of 0x80. The cost is that the top of the range reads
+         * 0.98 rather than 1.00 - the same "a 7-bit CC cannot quite
+         * reach the top" the hex reading has, where 127 shows FE. */
+        return ((knob.value - 64) / 64).toFixed(2);
+    }
     return String(knob.value);
 }
 
-/* A dial cell's own name label is 1 row of the device's fixed 5x7 font,
- * covered with 1px of headroom when the value is drawn over it - same
- * footprint drawCell's own "locked" background uses for exactly this text
- * (FONT_H + 1), just applied here from outside the library instead of
- * inside it. */
-const LABEL_ROW_H = 8;
+/* A label row: the device's fixed 5x7 font plus a clear pixel above AND
+ * below it. drawCell's own "locked" background uses FONT_H + 1, which
+ * leaves the glyphs sitting on the bottom edge of the fill - fine for a
+ * strip that spans the cell, wrong for the value pill, where the text
+ * reads as resting on the border rather than inside it. */
+const LABEL_ROW_H = 9;
 
 /* Draws the active song's current page in place of the plain-text status.
  * Returns false (draws nothing) if there's no song/page yet, so the caller
@@ -1993,26 +2508,7 @@ function drawSongPage() {
 
     clear_screen();
 
-    /* To swap the active knob's NAME for its VALUE in place, we need the
-     * exact pixel position renderPage used for that cell's name label - and
-     * render_page.mjs exports no way to ask for it (the layout constants
-     * that would derive it, HEADER_BLOCK/FONT_H/the dial radius, are all
-     * private to that file). Rather than duplicate them here and risk silent
-     * drift the next time that file's internals change, this wraps `print`
-     * for just this one call and records where each label actually landed -
-     * self-calibrating against whatever renderPage really drew, every frame.
-     * findLabelPrint then picks out the one belonging to a given slot. */
-    const labelPrints = [];
-    const probeCtx = {
-        fillRect: songPageDrawCtx.fillRect,
-        print: (x, y, text, color) => {
-            labelPrints.push({ x, y, text, color });
-            songPageDrawCtx.print(x, y, text, color);
-        },
-        textWidth: songPageDrawCtx.textWidth,
-    };
-
-    renderPage(probeCtx, {
+    renderPage(songPageDrawCtx, {
         page: { name: page.name || "", keys: pageKeys },
         metaIndex: cachedMetaIndex,
         values,
@@ -2023,24 +2519,30 @@ function drawSongPage() {
         touched: -1,
     });
 
-    if (activeKnobIndex >= 0 && isKnobReadoutActive(activeKnobIndex) && page.knobs[activeKnobIndex]) {
-        const labelPrint = findLabelPrint(labelPrints, activeKnobIndex);
-        if (labelPrint) {
-            const knob = page.knobs[activeKnobIndex];
-            /* The label was left-aligned to fit ITS OWN text; recover the
-             * cell's true horizontal centre from that print so the value -
-             * almost always a different width - centres correctly too. */
-            const cx = labelPrint.x + text_width(labelPrint.text) / 2;
-            /* Inverted, like drawCell's own "locked" row background - a
-             * solid fill (color 1) with the text cut into it in the
-             * background color (0), rather than plain text on the blank
-             * screen. Same idiom the shared library already uses for "this
-             * text means something different right now", reused here for
-             * the same reason. */
-            fill_rect(Math.round(cx - 16), labelPrint.y - 1, 32, LABEL_ROW_H, 1);
-            centeredText(songPageDrawCtx, cx, labelPrint.y, formatKnobReadoutValue(knob), 0);
-        }
+    /* A graphic replaces its members' cells, so renderPage draws them no
+     * labels - but you still need to know which knob is attack and which
+     * is decay. The picture only uses the top 13 rows of a 26-row cell
+     * (viz_draw's VIZ_ROWS), so the label row underneath is free for
+     * exactly this. */
+    const covered = new Set();
+    for (const g of viz) {
+        for (let i = 0; i < g.slotSpan; i++) covered.add(g.slotStart + i);
     }
+    for (const slot of covered) {
+        const knob = page.knobs[slot];
+        if (!knob) continue;
+        const active = isKnobReadoutActive(slot);
+        drawSlotLabel(slot, active ? formatKnobReadoutValue(knob) : knob.name, active);
+    }
+
+    /* An ordinary cell already has its name from renderPage; only the
+     * active one needs swapping for its value. */
+    if (activeKnobIndex >= 0 && !covered.has(activeKnobIndex)
+        && isKnobReadoutActive(activeKnobIndex) && page.knobs[activeKnobIndex]) {
+        drawSlotLabel(activeKnobIndex,
+                      formatKnobReadoutValue(page.knobs[activeKnobIndex]), true);
+    }
+
     return true;
 }
 
@@ -2050,7 +2552,9 @@ function drawSongPage() {
  * page_controller.mjs's gesture set (hold-to-reveal, Shift precision,
  * Mute+touch reset) are deferred to a follow-up phase rather than adopted
  * blind while the device is unreachable for verification. */
-const SONG_KNOB_MIDI_CHANNEL = 3;
+/* Channels and the master knob's CC are settings now - see
+ * DEFAULT_SETTINGS. M8's CONTROL MAP CHANNEL (MIDI Settings view) has to
+ * match settings.knobChannel or nothing the knobs send is heard. */
 
 function handleSongKnobTurn(data, shiftHeld) {
     const knobIndex = data[1] - 71;
@@ -2071,6 +2575,7 @@ function handleSongKnobTurn(data, shiftHeld) {
 
     const knob = page.knobs[knobIndex];
     if (!knob) return; /* empty slot - this encoder controls nothing here */
+    noteAuditionValue(knob);
     knob.value = Math.max(0, Math.min(127, knob.value + Math.sign(delta)));
     claimKnobTurn(knobIndex);
     /* Absolute: send the accumulated 0-127 value we track (today's
@@ -2079,7 +2584,7 @@ function handleSongKnobTurn(data, shiftHeld) {
      * still tracks an approximate position for the on-screen display either
      * way, but isn't what's on the wire in this mode. */
     const wireValue = knob.mode === KNOB_MODE_RELATIVE ? data[2] : knob.value;
-    move_midi_external_send([2 << 4 | 0xb, 0xb0 | SONG_KNOB_MIDI_CHANNEL, knob.cc, wireValue]);
+    move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel, knob.cc, wireValue]);
     markSongsDirty();
 }
 
@@ -2091,7 +2596,11 @@ function handleMasterKnobTurn(data) {
     const delta = decodeDelta(data[2]);
     if (delta === 0) return;
     masterKnobValue = Math.max(0, Math.min(127, masterKnobValue + Math.sign(delta)));
-    move_midi_external_send([2 << 4 | 0xb, 0xb0 | SONG_KNOB_MIDI_CHANNEL, 79, masterKnobValue]);
+    /* Same absolute/relative split as a song knob: Absolute sends the
+     * position we track, Relative forwards Move's own encoder byte and
+     * lets M8 accumulate. Channel and CC are its own, not the knobs'. */
+    const wireValue = settings.masterMode === KNOB_MODE_RELATIVE ? data[2] : masterKnobValue;
+    move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.masterChannel, settings.masterCc, wireValue]);
 }
 
 /* External MIDI handler (from M8) */
@@ -2158,9 +2667,9 @@ globalThis.onMidiMessageExternal = function (data) {
      * typing) - keep tracking M8's state above so a resync (queuePadRedraw,
      * on close) can catch the pads up, but don't paint over whatever screen
      * is currently showing. */
-    if (songMgmtOpen || knobEditOpen || knobWizardOpen) return;
+    if (songMgmtOpen || settingsOpen || knobEditOpen || knobWizardOpen) return;
 
-    let activeLppToMovePadMap = showingTop ? lppPadToMovePadMapTop : lppPadToMovePadMapBottom;
+    let activeLppToMovePadMap = padMapLppToMove();
     let moveNoteNumber = activeLppToMovePadMap.get(lppNoteNumber);
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
@@ -2179,7 +2688,7 @@ globalThis.onMidiMessageExternal = function (data) {
         return;
     }
 
-    let activeLppToMoveControlMap = showingTop ? lppNoteToMoveControlMapTop : lppNoteToMoveControlMapBottom;
+    let activeLppToMoveControlMap = controlMapLppToMove();
     let moveControlNumber = activeLppToMoveControlMap.get(lppNoteNumber);
 
     if (moveControlNumber === moveLOGO) {
@@ -2211,6 +2720,10 @@ globalThis.onMidiMessageInternal = function (data) {
         handleSongMgmtInput(data);
         return;
     }
+    if (settingsOpen) {
+        handleSettingsInput(data);
+        return;
+    }
     if (knobEditOpen) {
         handleKnobEditInput(data);
         return;
@@ -2226,22 +2739,25 @@ globalThis.onMidiMessageInternal = function (data) {
 
     if (isAt) return; /* Ignore aftertouch */
 
-    let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
+    let activeMoveToLppPadMap = padMapMoveToLpp();
 
     if (isNote) {
         let moveNoteNumber = data[1];
 
-        /* Wheel touch toggles top/bottom view */
+        /* Wheel touch: peek at the next view - see advanceViewMode. */
         if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
-            showingTop = !showingTop;
-            queuePadRedraw();
-            updateMoveViewPulse();
+            jogWheelHeld = true;
+            viewBeforePeek = viewMode;
+            advanceViewMode();
             return;
         }
 
         if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
+            jogWheelHeld = false;
+            revertAuditionedKnobs();
             if (!wheelClicked) {
-                showingTop = !showingTop;
+                /* Nothing committed it, so it was only a look. */
+                viewMode = viewBeforePeek;
                 queuePadRedraw();
                 updateMoveViewPulse();
             }
@@ -2295,7 +2811,7 @@ globalThis.onMidiMessageInternal = function (data) {
 
     if (isCC) {
         let moveControlNumber = data[1];
-        let activeMoveControlToLppNoteMap = showingTop ? moveControlToLppNoteMapTop : moveControlToLppNoteMapBottom;
+        let activeMoveControlToLppNoteMap = controlMapMoveToLpp();
         let lppNote = activeMoveControlToLppNoteMap.get(moveControlNumber);
 
         /* Store current view */
@@ -2306,14 +2822,19 @@ globalThis.onMidiMessageInternal = function (data) {
 
         /* Note: Shift+Wheel exit is handled at host level */
 
-        /* Wheel click. Shift+click opens Song Management (confirmed free -
-         * this combo was never forwarded to M8 either way, see
+        /* Wheel click. Shift+click opens Settings, of which the song list
+         * is one row (confirmed free - this combo was never forwarded to
+         * M8 either way, see
          * docs/plans/2026-09-10-song-based-knob-config.md). */
         if (moveControlNumber === moveWHEEL && data[2] === 0x7f) {
             if (shiftHeld) {
-                openSongManagement();
+                openSettings();
                 return;
             }
+            /* Committing the peek. Advancing as well is what makes the
+             * third view reachable in one gesture rather than needing a
+             * touch-and-click per step. */
+            if (wheelClicked) advanceViewMode();
             wheelClicked = true;
             return;
         }
@@ -2421,6 +2942,7 @@ globalThis.tick = function () {
         }
     }
     drainPadRedraw();
+    tickSongStepLeds();
     drawUI();
     flushSongsIfDirty();
 };
