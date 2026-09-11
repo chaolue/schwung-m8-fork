@@ -207,8 +207,48 @@ function controlMapMoveToLpp() {
  * third view is reached in one gesture. */
 let viewBeforePeek = VIEW_TOP;
 
+/* Which of M8's Launchpad screens is up, tracked from the button that
+ * asked for it. M8 starts on the primary Session screen; Back returns to
+ * it, Shift+Back reaches a SECOND session screen, Menu is Note and
+ * Capture is Sequencer. Nothing is sent back to say so, so the only way
+ * to know is to watch what we forward. */
+const LP_SESSION = 0;
+const LP_SESSION_ALT = 1;
+const LP_NOTE = 2;
+const LP_SEQ = 3;
+let lpMode = LP_SESSION;
+
+/* Odd rows halves the SESSION grid - it puts M8 phrase rows 0, 2, 4, 6
+ * on screen at once, so you see a whole phrase at half resolution. The
+ * Note and Sequencer screens are not phrase rows at all (a keyboard and
+ * a step editor), and the second Session screen is a different grid
+ * again, so on any of the three "every other row" describes nothing and
+ * just hides half the layout. The third view is therefore offered only
+ * on the primary Session screen. */
+function oddRowsAvailable() {
+    return settings.oddRows && lpMode === LP_SESSION;
+}
+
+/* Restated rather than remembered: the screen can change on any button
+ * press and the setting can change in Settings, and either one can strand
+ * the pads on a layout the cycle no longer reaches. Both call this. */
+function reconcileOddRowsView() {
+    if (oddRowsAvailable()) return;
+    /* The REMEMBERED view has to be cleaned up even when the current one
+     * is something else, because releasing the wheel restores it. Touch
+     * the wheel while on the odd view and the peek has already advanced
+     * past it, so odd survives only in viewBeforePeek - change screen in
+     * the middle of that gesture and letting go put the pads straight
+     * back on the view that had just been taken away. */
+    if (viewBeforePeek === VIEW_ODD) viewBeforePeek = VIEW_TOP;
+    if (viewMode !== VIEW_ODD) return;
+    viewMode = VIEW_TOP;
+    queuePadRedraw();
+    updateMoveViewPulse();
+}
+
 function viewStops() {
-    return settings.oddRows ? 3 : 2;
+    return oddRowsAvailable() ? 3 : 2;
 }
 
 function advanceViewMode() {
@@ -1010,6 +1050,20 @@ const M8_MOD_TYPES = [
  * differ only in what M8 calls their knobs, which is exactly the part
  * Connect supplies; three indistinguishable rows would be three ways to
  * ask for the same graphic. */
+/* Filter types whose CURVE is one already offered. ZDF is M8's
+ * zero-delay-feedback implementation of the same response - it sounds
+ * different and is a real choice on the instrument, but it draws the
+ * identical picture, and this list is chosen by picture. Which of the
+ * two it is, is a Connect question, exactly as with the three 3-knob
+ * envelopes.
+ *
+ * They stay in the TYPE picker under Instrument, where the choice is the
+ * M8 parameter rather than the graphic. */
+const VIZ_SAME_AS_TYPE = {
+    "ZDF LOWPASS": "LOWPASS",
+    "ZDF HIGHPASS": "HIGHPASS",
+};
+
 function fixedModeEntry(base, label, mode) {
     const entry = Object.assign({}, base, { label, fixedVizMode: mode });
     /* The mode is answered here, so the wizard must not ask for it. */
@@ -1040,11 +1094,10 @@ const M8_GENERIC_SHAPES = (() => {
     ];
     /* Built from the same entries the connected paths use, so a shape
      * offered here cannot describe different knobs from the one reached
-     * through Instrument. OFF is skipped: a filter that is off has no
-     * curve to draw and no reason to occupy two encoders. */
+     * through Instrument. */
     const filter = filterEntry(M8_FILTER_TYPES);
     for (const t of M8_FILTER_TYPES) {
-        if (t === "OFF") continue;
+        if (VIZ_SAME_AS_TYPE[t] || t === "OFF") continue;
         out.push(fixedModeEntry(filter, `Filter ${t}`, t));
     }
     const lfo = M8_MOD_TYPES.find((t) => t.name === "LFO");
@@ -1617,13 +1670,7 @@ function adjustSetting(row, step) {
             break;
         case "oddRows":
             settings.oddRows = step > 0;
-            /* Turning it off while it is the view being shown would leave
-             * the pads on a layout the cycle can no longer reach. */
-            if (!settings.oddRows && viewMode === VIEW_ODD) {
-                viewMode = VIEW_TOP;
-                queuePadRedraw();
-                updateMoveViewPulse();
-            }
+            reconcileOddRowsView();
             break;
         default:
             return;
@@ -2440,10 +2487,14 @@ function instrumentFrame(instrument) {
     const label = instrument.toString(16).toUpperCase().padStart(2, "0");
     const ctx = instCtx(instrument);
     const categories = [
+        /* "Base": the parameters every instrument has, whatever its type.
+         * It was "Generic", which now names the root's no-connection
+         * shape list - two different things one level apart under the
+         * same word. */
         {
-            name: "Generic",
+            name: "Base",
             open: () => pushWizardFrame(
-                paramListFrame("Generic", M8_INSTRUMENT_GENERIC, instrument, ctx)),
+                paramListFrame("Base", M8_INSTRUMENT_GENERIC, instrument, ctx)),
         },
         /* The mod SLOT, not the instrument, numbers a mod parameter's
          * name - see m8KnobName. */
@@ -3231,6 +3282,18 @@ globalThis.onMidiMessageInternal = function (data) {
         /* Store current view */
         if (moveControlNumber === moveBACK || moveControlNumber === moveMENU || moveControlNumber === moveCAP) {
             currentView = moveControlNumber;
+            /* Latched on the PRESS only. Shift is usually let go before
+             * the button it modified, so a release would report a plain
+             * Back and turn the second Session screen back into the
+             * first one without the M8 having moved. */
+            if (data[2] === 127) {
+                if (moveControlNumber === moveBACK) {
+                    lpMode = shiftHeld ? LP_SESSION_ALT : LP_SESSION;
+                } else {
+                    lpMode = moveControlNumber === moveMENU ? LP_NOTE : LP_SEQ;
+                }
+                reconcileOddRowsView();
+            }
             updateMoveViewPulse();
         }
 
