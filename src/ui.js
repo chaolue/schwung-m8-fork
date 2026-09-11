@@ -366,7 +366,9 @@ function drainPadRedraw() {
         const [moveNote, lppNote] = padRedrawEntries[i];
         const data = lppNoteValueMap.get(lppNote);
         if (data && data[0] !== 0) {
-            globalThis.onMidiMessageExternal(data);
+            /* Straight to the painter, never back through the external
+             * handler - see applyLppLed. */
+            applyLppLed(data[1], data[2], data[0] & 0xF0, data[0]);
         } else {
             /* M8 has never reported a color for this LPP note under the new
              * view (still the initial [0,0,0] placeholder) - replaying that
@@ -3172,11 +3174,22 @@ globalThis.onMidiMessageExternal = function (data) {
      * because it already received our proactive identity response. */
     markM8Connected();
 
-    let lppNoteNumber = data[1];
-    let lppVelocity = data[2];
+    lppNoteValueMap.set(data[1], [...data]);
+    applyLppLed(data[1], data[2], maskedValue, value);
+};
 
-    lppNoteValueMap.set(lppNoteNumber, [...data]);
-
+/* Paint one LPP LED onto the Move.
+ *
+ * Split out of the external handler so that REPLAYING a remembered LED -
+ * which is what a view change does, through drainPadRedraw - does not have
+ * to re-enter that handler. Re-entering it meant the replay ran the SysEx
+ * accumulator too, and a synthetic note arriving between an F0 and its F7
+ * was appended INTO the part-built message: the buffer no longer matched
+ * the identity request, so the handshake went unanswered and the M8 was
+ * left waiting. Rare while a redraw only followed a wheel-touch; routine
+ * once a screen change could start one, because that is exactly when the
+ * M8 is talking most. */
+function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     /* Song Management, Knob Settings and the Add Knob wizard all own the
      * pads/buttons while open (text_entry.mjs reuses the pad grid for
      * typing) - keep tracking M8's state above so a resync (queuePadRedraw,
@@ -3227,7 +3240,7 @@ globalThis.onMidiMessageExternal = function (data) {
             move_midi_internal_send([0x0b, 0xbe, moveControlNumber, black]);
         }
     }
-};
+}
 
 /* Internal MIDI handler (from Move) */
 globalThis.onMidiMessageInternal = function (data) {
