@@ -577,12 +577,18 @@ let settings = Object.assign({}, DEFAULT_SETTINGS);
 /* The filter's two knobs, as one entry. Stated once because Wavsynth
  * carries a longer type list and would otherwise be a second copy.
  *
- * `modeNames` renames the knobs for a type whose two controls are not
- * cutoff and resonance: M8's LP>HP is a lowpass corner and a HIGHPASS
- * corner, so calling them CUT and RES is simply wrong - and naming a
- * second pair CUT2/RES2 on the same page also collides with an ordinary
- * filter's, which makes render_page disambiguate them by appending the
- * slot number ("CUT24"). Right names, no collision. */
+ * `modeKnobs` replaces the whole member list for a type whose controls
+ * are not cutoff and resonance. M8's LP>HP is a lowpass corner and a
+ * HIGHPASS corner, so CUT and RES are the wrong names - and a second
+ * CUT/RES pair on one page collides with an ordinary filter's, which
+ * render_page disambiguates by appending the slot number ("CUT24").
+ *
+ * The ORDER differs too, which is why this replaces the list rather
+ * than just renaming it. RES is the highpass corner and CUT the lowpass
+ * one, so on the response curve RES owns the LEFT edge of the band and
+ * CUT the right; putting HP on the left knob makes the pair read the
+ * same way round as the picture above them. The roles are looked up by
+ * name, so the swap moves the knobs without touching the curve. */
 function filterEntry(types) {
     return {
         /* Just "Filter": drawMenuList budgets a fixed ~6px per glyph for
@@ -594,7 +600,12 @@ function filterEntry(types) {
         vizModeRole: "mode",
         vizModeOptions: types,
         vizModePrompt: "Filter Type",
-        modeNames: { "LP>HP": ["LP", "HP"] },
+        modeKnobs: {
+            "LP>HP": [
+                { m: "HP", def: 0x00, role: "resonance" },
+                { m: "LP", def: 0xFF, role: "cutoff" },
+            ],
+        },
         knobs: [
             { m: "CUT", def: 0xFF, role: "cutoff" },
             { m: "RES", def: 0x00, role: "resonance" },
@@ -1097,7 +1108,10 @@ function m8KnobName(stem, number) {
  * reads the song: allocating a run up front would hand the same number to
  * every member of a group. */
 function addKnobsFromEntry(song, entry, number, target, vizMode) {
-    const members = entry.knobs || [entry];
+    /* A mode may replace the member list outright - different names and
+     * a different order. See filterEntry's modeKnobs. */
+    const members = (vizMode && entry.modeKnobs && entry.modeKnobs[vizMode])
+        || entry.knobs || [entry];
     /* A target names the slot the gesture pointed at (the empty cell that
      * was touched). It is only honoured if the WHOLE run fits there within
      * one row - Shift+touching slot 3 and then choosing a 3-knob envelope
@@ -1113,9 +1127,6 @@ function addKnobsFromEntry(song, entry, number, target, vizMode) {
      * that fails the adjacency check and draws nothing. */
     const groupId = entry.vizKind ? `g${makeSongId()}` : null;
 
-    /* A type whose controls are not what the entry's default names say -
-     * see filterEntry's modeNames. */
-    const renamed = (entry.modeNames && vizMode) ? entry.modeNames[vizMode] : null;
     /* Stored in the vocabulary the viz layer matches on, which is not
      * always the one the picker showed - see M8_LFO_SHAPE_ALIASES. */
     const storedMode = (vizMode && M8_LFO_SHAPE_ALIASES[vizMode]) || vizMode;
@@ -1124,7 +1135,7 @@ function addKnobsFromEntry(song, entry, number, target, vizMode) {
         const slot = place.slot + i;
         if (slot >= KNOBS_PER_PAGE) return;
         const knob = makeKnobConfig(nextFreeCc(song), {
-            name: m8KnobName(renamed ? renamed[i] || member.m : member.m, number),
+            name: m8KnobName(member.m, number),
             def: member.def,
             scale: member.scale,
             viz: groupId ? { group: groupId, kind: entry.vizKind, role: member.role } : undefined,
