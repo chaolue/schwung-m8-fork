@@ -760,9 +760,24 @@ function filterEntry(types) {
         vizModeOptions: types,
         vizModePrompt: "Filter Type",
         modeKnobs: {
+            /* Two independent corners and no resonance at all: M8's CUT
+             * drives the LOWPASS (FF = wide open) and its RES drives the
+             * HIGHPASS (00 = at DC), so both parameters are "off" at
+             * their defaults and either one squeezes the band from its
+             * own side.
+             *
+             * IN THE M8'S OWN PARAMETER ORDER, CUT then RES, and that
+             * ordering is the whole point. M8 mapping is a LEARN system,
+             * so the natural gesture is to walk down the M8's screen
+             * mapping each row to the next knob - and with the pair the
+             * other way round that silently crossed them. The sound
+             * followed CUT while the picture moved the highpass corner,
+             * which reads as a drawing bug and is not one. The pair was
+             * HP-first by request; the request predated knowing that
+             * these are RES and CUT in that order. */
             [FILTER_LP_HP]: [
-                { m: "HP", label: "Highpass", def: 0x00, role: "resonance" },
                 { m: "LP", label: "Lowpass", def: 0xFF, role: "cutoff" },
+                { m: "HP", label: "Highpass", def: 0x00, role: "resonance" },
             ],
         },
         knobs: [
