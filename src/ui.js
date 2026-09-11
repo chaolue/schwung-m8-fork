@@ -247,6 +247,98 @@ function reconcileOddRowsView() {
     updateMoveViewPulse();
 }
 
+/* ------------------------------------------------------------- tracing */
+
+/* Which LPP notes the M8 actually lights, per screen.
+ *
+ * The module is a blind emulator - it maps notes both ways and has never
+ * had to know what M8 puts where. That is fine until a screen turns out
+ * to use rows the current view does not show, at which point the pads
+ * look dead and there is nothing in the module that can say why. So this
+ * records the lit set for a few seconds after each screen change and
+ * writes it out as a grid.
+ *
+ * OFF unless `trace_on` exists beside the module, and read ONCE at init:
+ * a file check per MIDI event would cost more than the feature. Delete
+ * the file to stop. Writes go to /data/UserData (never the device's
+ * root filesystem, which is full). */
+/* Derived in a FUNCTION rather than a const: MODULE_DIR is declared
+ * further down the file, and a const referring to it from up here is
+ * read during module evaluation, when it is still in its temporal dead
+ * zone - which throws on import, a failure `node --check` cannot see.
+ * A function body is not evaluated until it is called, by which time
+ * every declaration has run. */
+function tracePath(name) {
+    return `${MODULE_DIR}/${name}`;
+}
+const TRACE_FRAMES = 130;          /* ~3 s at 44 Hz */
+let traceOn = false;
+let tracePending = [];
+let traceFramesLeft = 0;
+let traceLit = null;
+let traceLabel = "";
+
+function traceWrite(line) {
+    if (!traceOn) return;
+    tracePending.push(line);
+}
+
+/* Appending means re-reading, because std has no append mode here. The
+ * log is small (a few lines per screen change) and only written while
+ * tracing, so the cost is irrelevant next to losing the history on every
+ * flush. */
+function traceFlush() {
+    if (!traceOn || !tracePending.length) return;
+    const path = tracePath("trace.log");
+    const previous = std.loadFile(path) || "";
+    const f = std.open(path, "w");
+    if (f) {
+        f.puts(previous + tracePending.join("\n") + "\n");
+        f.close();
+    }
+    tracePending = [];
+}
+
+/* Start collecting the lit set for the screen just entered. */
+function traceScreen(label) {
+    if (!traceOn) return;
+    traceReport();
+    traceLabel = label;
+    traceLit = new Map();
+    traceFramesLeft = TRACE_FRAMES;
+    traceWrite(`--- ${label} (view ${viewMode}, oddAvailable ${oddRowsAvailable()})`);
+}
+
+function traceLed(lppNote, velocity, on) {
+    if (!traceOn || !traceLit) return;
+    if (on && velocity > 0) traceLit.set(lppNote, velocity);
+    else traceLit.delete(lppNote);
+}
+
+/* The lit set as an 8x8 picture, rows 8 (top) down to 1, so it can be
+ * compared with the M8's screen directly. A digit is a lit pad. */
+function traceReport() {
+    if (!traceOn || !traceLit) return;
+    const rows = [];
+    for (let r = 8; r >= 1; r--) {
+        let line = `  row ${r}: `;
+        for (let c = 1; c <= 8; c++) line += traceLit.has(r * 10 + c) ? "#" : ".";
+        rows.push(line);
+    }
+    const edge = [...traceLit.keys()].filter((n) => n < 11 || n > 88 || n % 10 === 0 || n % 10 === 9);
+    traceWrite(`  lit under "${traceLabel}": ${traceLit.size} pads`);
+    for (const r of rows) traceWrite(r);
+    traceWrite(`  edge/control notes lit: ${JSON.stringify(edge.sort((a, b) => a - b))}`);
+    traceLit = null;
+    traceFlush();
+}
+
+function traceTick() {
+    if (!traceOn || traceFramesLeft <= 0) return;
+    traceFramesLeft--;
+    if (traceFramesLeft === 0) traceReport();
+}
+
 function viewStops() {
     return oddRowsAvailable() ? 3 : 2;
 }
@@ -478,6 +570,10 @@ function markM8Connected() {
     initRetryTicks = 0;
     viewMode = VIEW_TOP;
     loadSongs();
+    if (traceOn) {
+        traceWrite(`=== M8 connected, oddRows ${settings.oddRows} ===`);
+        traceScreen("Session (startup)");
+    }
     updateSongStepLeds(true);
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
 }
@@ -3175,6 +3271,7 @@ globalThis.onMidiMessageExternal = function (data) {
     markM8Connected();
 
     lppNoteValueMap.set(data[1], [...data]);
+    traceLed(data[1], data[2], noteOn);
     applyLppLed(data[1], data[2], maskedValue, value);
 };
 
@@ -3356,6 +3453,9 @@ globalThis.onMidiMessageInternal = function (data) {
                     lpMode = moveControlNumber === moveMENU ? LP_NOTE : LP_SEQ;
                 }
                 reconcileOddRowsView();
+                traceScreen(moveControlNumber === moveBACK
+                    ? (shiftHeld ? "Session 2 (Shift+Back)" : "Session (Back)")
+                    : moveControlNumber === moveMENU ? "Note (Menu)" : "Sequencer (Capture)");
             }
             updateMoveViewPulse();
         }
@@ -3452,6 +3552,11 @@ globalThis.init = function () {
         shadow_set_overtake_suppress_master_volume(1);
     }
 
+    /* Armed here, but the first screen is logged from markM8Connected:
+     * the settings are not read until then, and there is no screen to
+     * describe until the M8 is talking. */
+    traceOn = !!std.loadFile(tracePath("trace_on"));
+
     /* Proactively send LPP identity on startup - this handles the case where
      * M8 sent its identity request before the module loaded. The M8 will
      * recognize the LPP identity response and start communicating. */
@@ -3470,6 +3575,7 @@ globalThis.onUnload = function () {
 };
 
 globalThis.tick = function () {
+    traceTick();
     /* Proactively send LPP identity until M8 connects.
      * This handles the case where M8 sent its identity request before
      * the module loaded (e.g., when entering overtake mode after M8 is

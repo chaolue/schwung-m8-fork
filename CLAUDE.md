@@ -57,3 +57,15 @@ Two gotchas: `drawMenuList`'s scrollbar needs `set_pixel` stubbed (only
 reached once a list is long enough to scroll), and `drawMenuHeader` draws its
 title with a pixel font, so a header is invisible to `print`-log assertions —
 assert on list contents instead.
+
+**`node --check` cannot see the failure this module fails with most often.**
+Four times now a `const` has been placed above another `const` it refers to;
+the reference is evaluated during module evaluation, while the target is still
+in its temporal dead zone, so the module throws `ReferenceError: Cannot access
+'X' before initialization` **on import** while the syntax check passes clean.
+Running any harness test catches it immediately — so run one before every
+deploy, not just when the change looks risky. Where a value is only needed at
+call time (a path built from `MODULE_DIR`, say), derive it in a **function**
+rather than a `const`: a function body is not evaluated until it runs, by which
+point every declaration has, and the ordering hazard disappears rather than
+being re-sorted.
