@@ -602,8 +602,8 @@ function filterEntry(types) {
         vizModePrompt: "Filter Type",
         modeKnobs: {
             "LP>HP": [
-                { m: "HP", def: 0x00, role: "resonance" },
-                { m: "LP", def: 0xFF, role: "cutoff" },
+                { m: "HP", label: "Highpass", def: 0x00, role: "resonance" },
+                { m: "LP", label: "Lowpass", def: 0xFF, role: "cutoff" },
             ],
         },
         knobs: [
@@ -1089,6 +1089,78 @@ function runFitsAt(song, target, count) {
         if (page.knobs[target.slot + i]) return false;
     }
     return true;
+}
+
+/* Name stem -> what that knob is, so a knob carrying no stored `detail`
+ * can still be described.
+ *
+ * `detail` is attached when the wizard creates a knob, which does
+ * nothing for the knobs that already exist - and every knob on a device
+ * that has been in use predates the field. Deriving from the NAME fixes
+ * those retroactively and costs no storage, so the stored value is now
+ * only a more precise answer where one was recorded.
+ *
+ * Built from the catalogue itself rather than written out again, so a
+ * parameter cannot be renamed in one place and described from the
+ * other. */
+const M8_STEM_INDEX = (() => {
+    const index = Object.create(null);
+    const add = (m, label, kind, ctx) => {
+        if (!m || index[m]) return;          /* first definition wins */
+        index[m] = { label: label || m, kind, ctx };
+    };
+    /* Two passes per list, because a multi-knob GRAPHIC entry lists the same
+     * stems as the individual entries beside it but is labelled for the
+     * picture rather than the parameter - modType()'s graphic carries
+     * "Envelope (3 knobs)" and its members carry no label at all. Taking the
+     * graphic's label made CUT read "Filter" and FRQ read "LFO". So the
+     * individually-named entries are indexed FIRST and a graphic member is
+     * only a fallback, and only when it names itself. */
+    const addParams = (params, kind, ctx) => {
+        for (const p of params || []) {
+            if (p.knobs) continue;
+            add(p.m, p.label, kind, ctx);
+        }
+        for (const p of params || []) {
+            if (!p.knobs) continue;
+            for (const k of p.knobs) add(k.m, k.label, kind, ctx);
+            for (const list of Object.values(p.modeKnobs || {})) {
+                for (const k of list) add(k.m, k.label, kind, ctx);
+            }
+        }
+    };
+    addParams(M8_MIXER_PARAMS, "mix");
+    for (const g of M8_SEND_GROUPS) addParams(g.params, "send", g.ctx);
+    addParams(M8_INSTRUMENT_GENERIC, "inst");
+    for (const t of M8_INSTRUMENT_TYPES) addParams(typeParamsFor(t), "inst");
+    for (const t of M8_MOD_TYPES) addParams(t.params, "mod");
+    return index;
+})();
+
+/* Longest first, so "DEC" is not matched as "DE". */
+const M8_STEMS_BY_LENGTH = Object.keys(M8_STEM_INDEX).sort((a, b) => b.length - a.length);
+
+/* What a knob is connected to: the recorded answer if there is one,
+ * otherwise read back out of its name. A mod parameter is named for its
+ * SLOT rather than its instrument (see m8KnobName), so a derived mod
+ * detail can say "M2 Attack" but not which instrument - the recorded
+ * one can, which is why it is still worth storing. */
+function knobDetail(knob) {
+    if (!knob) return "";
+    if (knob.detail) return knob.detail;
+    const name = String(knob.name || "");
+    for (const stem of M8_STEMS_BY_LENGTH) {
+        if (!name.startsWith(stem)) continue;
+        const entry = M8_STEM_INDEX[stem];
+        const suffix = name.slice(stem.length);
+        let ctx = "";
+        if (entry.kind === "mix") ctx = "MIX";
+        else if (entry.kind === "send") ctx = entry.ctx || "";
+        else if (entry.kind === "inst") ctx = suffix ? `I${suffix}` : "";
+        else if (entry.kind === "mod") ctx = suffix ? `M${suffix}` : "";
+        return [ctx, entry.label].filter(Boolean).join(" ");
+    }
+    return "";
 }
 
 /* "VT" + track 3 -> "VT3"; "CUT" + instrument 0x1A -> "CUT1A". Numbers are
@@ -2563,7 +2635,7 @@ function drawSongPage() {
      * song name on the left. */
     const activeKnob = (activeKnobIndex >= 0 && isKnobReadoutActive(activeKnobIndex))
         ? page.knobs[activeKnobIndex] : null;
-    const headerRight = (activeKnob && activeKnob.detail) || page.name || "";
+    const headerRight = (activeKnob && knobDetail(activeKnob)) || page.name || "";
 
     renderPage(songPageDrawCtx, {
         page: { name: headerRight, keys: pageKeys },
