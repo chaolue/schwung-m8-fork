@@ -472,6 +472,27 @@ function drainPadRedraw() {
     padRedrawIndex = end;
 }
 
+/* Hand a message to the pad keyboard, and put the pads back when it
+ * closes.
+ *
+ * text_entry.mjs reuses the PAD GRID as its keyboard, painting letters
+ * over whatever the pads were showing. Closing it restored nothing, so
+ * the grid was left carrying Move's own colours until something else
+ * happened to trigger a resync.
+ *
+ * The resync belongs to the KEYBOARD closing rather than to the screen
+ * closing, which is why it could not simply live in closeSongManagement:
+ * renaming returns you to Song Management, a screen you then stay on, so
+ * the only close that had a resync was one that had not happened yet.
+ *
+ * Returns true when the keyboard consumed the message. */
+function routeTextEntryInput(data) {
+    if (!isTextEntryActive()) return false;
+    handleTextEntryMidi(data);
+    if (!isTextEntryActive()) queuePadRedraw();
+    return true;
+}
+
 function updateMoveViewPulse() {
     setButtonLED(moveBACK, dim_grey);
     setButtonLED(moveMENU, dim_grey);
@@ -1110,7 +1131,7 @@ const M8_MOD_TYPES = [
     modType({
         name: "AHD Envelope",
         vizKind: "envelope",
-        graphicLabel: "Envelope (3 knobs)",
+        graphicLabel: "Envelope",
         extras: [M8_MOD_AMOUNT],
         shape: [
             { m: "ATK", label: "Attack", def: 0x00, role: "attack" },
@@ -1133,7 +1154,7 @@ const M8_MOD_TYPES = [
     modType({
         name: "Drum Envelope",
         vizKind: "envelope",
-        graphicLabel: "Envelope (3 knobs)",
+        graphicLabel: "Envelope",
         extras: [M8_MOD_AMOUNT],
         /* PEAK/BODY/DECAY are the drum envelope's own names; they map onto
          * the envelope drawer's attack/hold/decay roles because that is the
@@ -1162,7 +1183,7 @@ const M8_MOD_TYPES = [
     modType({
         name: "Trig Envelope",
         vizKind: "envelope",
-        graphicLabel: "Envelope (3 knobs)",
+        graphicLabel: "Envelope",
         extras: [M8_MOD_AMOUNT],
         shape: [
             { m: "ATK", label: "Attack", def: 0x00, role: "attack" },
@@ -1971,7 +1992,7 @@ function closeSongManagementToPerform() {
 
 function renameSong(song) {
     openTextEntry({
-        title: "Rename Song",
+        title: "Song Name",
         initialText: song.name,
         onConfirm: (text) => {
             const trimmed = (text || "").trim();
@@ -2021,10 +2042,7 @@ function deleteSong(index) {
 }
 
 function handleSongMgmtInput(data) {
-    if (isTextEntryActive()) {
-        handleTextEntryMidi(data);
-        return;
-    }
+    if (routeTextEntryInput(data)) return;
 
     const isCCMsg = data[0] === 0xb0;
     if (!isCCMsg) return; /* pads/notes: no meaning here outside text entry */
@@ -2242,10 +2260,7 @@ function renameKnob(knob) {
 }
 
 function handleKnobEditInput(data) {
-    if (isTextEntryActive()) {
-        handleTextEntryMidi(data);
-        return;
-    }
+    if (routeTextEntryInput(data)) return;
 
     const page = getActivePage();
     const knob = page ? page.knobs[knobEditIndex] : null;
@@ -2688,10 +2703,7 @@ function handleKnobWizardInput(data) {
     /* Generic > Knob hands the pads to text_entry.mjs; it owns everything until it
      * confirms or cancels. A cancel leaves the wizard standing on the group
      * list, which is where Back would have put it anyway. */
-    if (isTextEntryActive()) {
-        handleTextEntryMidi(data);
-        return;
-    }
+    if (routeTextEntryInput(data)) return;
     if (data[0] !== 0xb0) return;
 
     const frame = currentWizardFrame();
@@ -2788,6 +2800,17 @@ function drawKnobWizard() {
     drawMenuList({
         items: frame.items,
         selectedIndex: frame.cursor,
+        /* This list carries the longest labels in the module - "Filter
+         * Highpass", "LFO Square Down" - against the shortest values,
+         * which are all "2kn". The default columns are laid out for the
+         * opposite shape (a 9px indent and a value column starting at
+         * 92), which left 12 characters for a 15-character label and
+         * ran it into the value.
+         *
+         * Both edges move: dropping the indent alone still leaves the
+         * longest rows a character short. */
+        labelX: 2,
+        valueX: 104,
         getLabel: (item) => frame.getLabel(item),
         getValue: (item) => frame.getValue(item),
     });
