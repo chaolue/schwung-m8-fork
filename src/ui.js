@@ -993,6 +993,68 @@ const M8_MOD_TYPES = [
     }),
 ];
 
+/* ------------------------------------------------------ generic: shapes */
+
+/* Knobs chosen by their PICTURE, with no M8 parameter behind them yet.
+ *
+ * M8's mapping is a learn system - the device is told which CC drives
+ * which parameter, and nothing here addresses a parameter by CC - so a
+ * knob's "connection" is only ever a NAME, a sensible starting value and
+ * the line the header spells out. Which means it can be decided after the
+ * fact, and often wants to be: you know you want an envelope on this row
+ * long before you have settled which instrument's third mod slot it is.
+ * Knob Settings > Connect fills it in later.
+ *
+ * By shape rather than by type, so the three 3-knob envelopes M8 has -
+ * AHD, Drum and Trig - are ONE row. They draw the identical picture and
+ * differ only in what M8 calls their knobs, which is exactly the part
+ * Connect supplies; three indistinguishable rows would be three ways to
+ * ask for the same graphic. */
+function fixedModeEntry(base, label, mode) {
+    const entry = Object.assign({}, base, { label, fixedVizMode: mode });
+    /* The mode is answered here, so the wizard must not ask for it. */
+    delete entry.vizModeOptions;
+    delete entry.vizModePrompt;
+    return entry;
+}
+
+const M8_GENERIC_SHAPES = (() => {
+    const out = [
+        {
+            label: "Envelope (3)", vizKind: "envelope",
+            knobs: [
+                { m: "ATK", label: "Attack", def: 0x00, role: "attack" },
+                { m: "HLD", label: "Hold", def: 0x00, role: "hold" },
+                { m: "DEC", label: "Decay", def: 0x80, role: "decay" },
+            ],
+        },
+        {
+            label: "Envelope (4)", vizKind: "envelope",
+            knobs: [
+                { m: "ATK", label: "Attack", def: 0x00, role: "attack" },
+                { m: "DEC", label: "Decay", def: 0x80, role: "decay" },
+                { m: "SUS", label: "Sustain", def: 0x80, role: "sustain" },
+                { m: "REL", label: "Release", def: 0x80, role: "release" },
+            ],
+        },
+    ];
+    /* Built from the same entries the connected paths use, so a shape
+     * offered here cannot describe different knobs from the one reached
+     * through Instrument. OFF is skipped: a filter that is off has no
+     * curve to draw and no reason to occupy two encoders. */
+    const filter = filterEntry(M8_FILTER_TYPES);
+    for (const t of M8_FILTER_TYPES) {
+        if (t === "OFF") continue;
+        out.push(fixedModeEntry(filter, `Filter ${t}`, t));
+    }
+    const lfo = M8_MOD_TYPES.find((t) => t.name === "LFO");
+    const lfoGraphic = lfo && lfo.params.find((p) => p.vizKind === "lfo");
+    if (lfoGraphic) {
+        for (const s of M8_LFO_SHAPES) out.push(fixedModeEntry(lfoGraphic, `LFO ${s}`, s));
+    }
+    return out;
+})();
+
 function makeKnobConfig(cc, opts) {
     const o = opts || {};
     /* A byte-scaled default halves into the 0-127 the knob stores and
@@ -1248,6 +1310,11 @@ function m8KnobName(stem, number) {
  * the stem index is the fallback, which is the same table knobDetail reads
  * and so cannot disagree with it. */
 function memberDetail(ctx, member, entry) {
+    /* With no context there is nothing to record that the name does not
+     * already carry - and storing one anyway would make an UNCONNECTED
+     * Generic shape indistinguishable from a connected knob on the
+     * Connect row, which reports exactly this field. */
+    if (!ctx) return "";
     const named = member.label
         || (M8_STEM_INDEX[member.m] && M8_STEM_INDEX[member.m].label)
         || (member === entry ? entry.label : "")
@@ -1255,11 +1322,15 @@ function memberDetail(ctx, member, entry) {
     return [ctx, named].filter(Boolean).join(" ");
 }
 
+/* The knobs an entry turns into. A mode may replace the list outright -
+ * different names and a different order. See filterEntry's modeKnobs. */
+function entryMembers(entry, vizMode) {
+    const mode = vizMode || entry.fixedVizMode;
+    return (mode && entry.modeKnobs && entry.modeKnobs[mode]) || entry.knobs || [entry];
+}
+
 function addKnobsFromEntry(song, entry, number, target, vizMode, ctx) {
-    /* A mode may replace the member list outright - different names and
-     * a different order. See filterEntry's modeKnobs. */
-    const members = (vizMode && entry.modeKnobs && entry.modeKnobs[vizMode])
-        || entry.knobs || [entry];
+    const members = entryMembers(entry, vizMode);
     /* A target names the slot the gesture pointed at (the empty cell that
      * was touched). It is only honoured if the WHOLE run fits there within
      * one row - Shift+touching slot 3 and then choosing a 3-knob envelope
@@ -1303,6 +1374,67 @@ function addKnobsFromEntry(song, entry, number, target, vizMode, ctx) {
     ensureSparePage(song);
     markSongsDirty();
     return place;
+}
+
+/* Re-point knobs that already exist at a different M8 parameter, keeping
+ * their SLOTS and their CCs.
+ *
+ * The CC is what the M8 has been taught, so changing it would silently
+ * unlearn the mapping; the slot is a physical encoder the user has
+ * already put their hand on. Everything else - name, starting value, the
+ * line the header shows, and the picture - describes the parameter and so
+ * follows it.
+ *
+ * A graphic travels as a BLOCK, the same one Slot moves (knobMoveBlock),
+ * because connecting one cell of an envelope to something else would
+ * leave viz.mjs a group whose members disagree. */
+function connectKnobsFromEntry(song, entry, number, vizMode, ctx, index) {
+    const page = song.pages[activePageIndex];
+    if (!page || !page.knobs[index]) return;
+    const block = knobMoveBlock(page, index);
+    const members = entryMembers(entry, vizMode);
+    const storedMode = (vizMode && M8_LFO_SHAPE_ALIASES[vizMode]) || vizMode;
+
+    /* Reuse the group id if there is one, so a connected envelope stays
+     * the same picture rather than becoming a second group over the same
+     * cells. */
+    const head = page.knobs[block.start];
+    const groupId = entry.vizKind
+        ? ((head && head.viz && head.viz.group) || `g${makeSongId()}`)
+        : null;
+
+    const paired = Math.min(block.size, members.length);
+    for (let i = 0; i < block.size; i++) {
+        const knob = page.knobs[block.start + i];
+        if (!knob) continue;
+        /* A block longer than the entry - a 4-knob envelope connected to a
+         * 3-knob one - leaves knobs over. They keep their names but LOSE
+         * the group: left in it they would carry a role the new picture
+         * does not draw, which is a cell inside the graphic that nothing
+         * ever updates. */
+        if (i >= paired) {
+            delete knob.viz;
+            delete knob.vizMode;
+            continue;
+        }
+        const member = members[i];
+        const noteScaled = member.scale === M8_NOTE_SCALE;
+        const raw = member.def === undefined ? 0 : (noteScaled ? member.def : member.def / 2);
+        knob.name = m8KnobName(member.m, number);
+        knob.detail = memberDetail(ctx, member, entry);
+        /* The old value described the old parameter, so it is not worth
+         * keeping - 0xE0 meant "most of the way up" as a track volume and
+         * means something else entirely as a filter cutoff. */
+        knob.value = Math.max(0, Math.min(127, Math.round(raw)));
+        knob.default = knob.value;
+        if (noteScaled) knob.scale = M8_NOTE_SCALE;
+        else delete knob.scale;
+        delete knob.vizMode;
+        if (groupId) knob.viz = { group: groupId, kind: entry.vizKind, role: member.role };
+        else delete knob.viz;
+        if (i === 0 && groupId && storedMode) knob.vizMode = storedMode;
+    }
+    markSongsDirty();
 }
 
 /* Keep an empty page at the end whenever the last one is full.
@@ -1794,9 +1926,9 @@ function drawSongMgmt() {
  * "add" is here as well as on an empty slot because a FULL page has no
  * empty slot left to touch - that is the case auto-page-creation exists
  * for, and without a second door it would be unreachable. */
-const KNOB_SETTINGS_FIELDS = ["name", "cc", "mode", "display", "move", "add", "remove"];
+const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "mode", "display", "move", "add", "remove"];
 const KNOB_SETTINGS_LABELS = {
-    name: "Name", cc: "CC", mode: "Mode", display: "Display",
+    name: "Name", connect: "Connect", cc: "CC", mode: "Mode", display: "Display",
     move: "Slot", add: "Add Knob", remove: "Remove Knob",
 };
 
@@ -1984,6 +2116,14 @@ function handleKnobEditInput(data) {
             renameKnob(knob);
             return;
         }
+        if (field === "connect") {
+            const index = knobEditIndex;
+            closeKnobEdit();
+            /* Same wizard, same catalogue - it re-points this knob at the
+             * leaf instead of making a new one, and comes back here. */
+            openKnobWizard(null, index);
+            return;
+        }
         if (field === "add") {
             closeKnobEdit();
             /* No target: placement is worked out when the leaf is chosen,
@@ -2026,6 +2166,12 @@ function drawKnobEdit() {
         getLabel: (field) => KNOB_SETTINGS_LABELS[field],
         getValue: (field) => {
             if (field === "name") return knob.name;
+            /* The RECORDED connection, never the one derived from the
+             * name. A dash means the header cannot say which instrument
+             * this knob belongs to, which is the whole reason to come
+             * here - so a guess in this column would hide the knobs that
+             * need the row. */
+            if (field === "connect") return knob.detail ? shortLabel(knob.detail) : "-";
             if (field === "cc") return String(knob.cc);
             if (field === "mode") return KNOB_MODE_OPTIONS[knob.mode];
             if (field === "display") return KNOB_DISPLAY_OPTIONS[knob.display];
@@ -2075,9 +2221,17 @@ let knobWizardTarget = null;
  * down to whichever leaf finally commits. */
 let knobWizardInstrument = 0;
 
-function openKnobWizard(target) {
+/* >= 0 while the wizard is re-pointing an EXISTING knob rather than
+ * making a new one: the slot on the active page whose Connect row opened
+ * it. The two walks are the same catalogue and the same frames - only
+ * what happens at the leaf differs - so a second wizard would have been
+ * the same code with one line changed. */
+let knobWizardConnect = -1;
+
+function openKnobWizard(target, connectIndex) {
     knobWizardOpen = true;
     knobWizardTarget = target || null;
+    knobWizardConnect = connectIndex === undefined ? -1 : connectIndex;
     knobWizardInstrument = 0;
     knobWizardStack = [];
     pushWizardFrame(rootWizardFrame());
@@ -2085,6 +2239,7 @@ function openKnobWizard(target) {
 
 function closeKnobWizard() {
     knobWizardOpen = false;
+    knobWizardConnect = -1;
     knobWizardStack = [];
     cachedSongId = null; /* the page's shape may have changed - rebuild the meta */
     queuePadRedraw();
@@ -2137,6 +2292,15 @@ function commitWizardEntry(entry, number, vizMode) {
          * way to the screen by knobDetail. The 3-letter stem under the
          * dial cannot say which instrument or which mod slot, and that is
          * the thing worth knowing. */
+        if (knobWizardConnect >= 0) {
+            const index = knobWizardConnect;
+            connectKnobsFromEntry(song, entry, number, vizMode, wizardCtx(), index);
+            closeKnobWizard();
+            /* Straight back to the row that asked, so the new name and
+             * connection are visible where the change was made. */
+            openKnobEdit(index);
+            return;
+        }
         addKnobsFromEntry(song, entry, number, knobWizardTarget, vizMode, wizardCtx());
     }
     closeKnobWizard();
@@ -2147,6 +2311,12 @@ function commitWizardEntry(entry, number, vizMode) {
  * becomes a knob - so the wizard asks, as one more step, and the answer is
  * stored with the group. Entries without one commit straight away. */
 function pickEntry(entry, number) {
+    /* A Generic shape IS its mode - "LFO SIN" was the row that was
+     * clicked - so there is nothing left to ask. */
+    if (entry.fixedVizMode) {
+        commitWizardEntry(entry, number, entry.fixedVizMode);
+        return;
+    }
     if (!entry.vizModeOptions) {
         commitWizardEntry(entry, number);
         return;
@@ -2208,21 +2378,16 @@ function paramListFrame(title, params, number, ctx) {
  * knob. Instrument > Mods still exists for the one thing it does add,
  * which is recording the instrument for the header. */
 function genericFrame() {
-    const entries = [
-        { name: "Knob", open: () => openOtherKnobEntry() },
-    ];
-    /* The type is chosen HERE and the slot after it, which is the reverse
-     * of Instrument > Mods - the type is what the user came to this list
-     * for, so the slot frame is reused with its type step pre-answered
-     * rather than asking for the same thing twice. */
-    for (const t of M8_MOD_TYPES) {
-        entries.push({ name: t.name, open: () => pushWizardFrame(modSlotFrame("", t)) });
-    }
+    const entries = [{ name: "Knob", entry: null }];
+    for (const e of M8_GENERIC_SHAPES) entries.push({ name: e.label, entry: e });
+    /* One level, and it commits: no instrument, no mod slot, no track.
+     * Everything here is chosen by its picture and connected afterwards
+     * from Knob Settings, which is the whole point of the list. */
     return listFrame(
         "Generic", entries,
         (e) => e.name,
-        () => "",
-        (e) => e.open());
+        (e) => (e.entry ? `${entryMembers(e.entry).length}kn` : ""),
+        (e) => (e.entry ? pickEntry(e.entry, null) : openOtherKnobEntry()));
 }
 
 function rootWizardFrame() {
@@ -2249,21 +2414,18 @@ function rootWizardFrame() {
     return listFrame("Add Knob", groups, (g) => g.name, () => "", (g) => g.open());
 }
 
-/* Mods are numbered by SLOT, so they are the one instrument category that
- * does not actually need the instrument - which is why they are offered
- * both here (recording which instrument, for the header) and at the root
- * under Generic (two steps shorter). */
-function modSlotFrame(ctx, fixedType) {
+/* A mod parameter's NAME is numbered by its slot ("ATK2"), so the
+ * instrument is the one thing about it the name can never say - which is
+ * exactly why this path records it in the context and why there is no
+ * instrument-free shortcut to it. Generic offers the mod GRAPHICS with no
+ * connection at all; naming one is always this walk. */
+function modSlotFrame(ctx) {
     return listFrame(
-        fixedType ? fixedType.name : "Mod Slot", [1, 2, 3, 4],
+        "Mod Slot", [1, 2, 3, 4],
         (n) => `Mod ${n}`,
         () => "",
         (n) => {
             const slotCtx = [ctx, `M${n}`].filter(Boolean).join(" ");
-            if (fixedType) {
-                pushWizardFrame(paramListFrame(fixedType.name, fixedType.params, n, slotCtx));
-                return;
-            }
             pushWizardFrame(listFrame(
                 `Mod ${n}`, M8_MOD_TYPES,
                 (t) => t.name,
