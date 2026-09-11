@@ -1091,6 +1091,43 @@ function runFitsAt(song, target, count) {
     return true;
 }
 
+/* ------------------------------------------------- abbreviating the detail */
+
+/* The header's right-hand slot is about 14 characters wide, and "Ins1A "
+ * spends six of them before the parameter is named at all. renderPage does
+ * shorten an over-long one, but it does it by chopping - "Track Volume"
+ * came out as "Tra Volume" - so the words are abbreviated here, where a
+ * human picked each one, and the library's fitter is left as the backstop
+ * for the few that are still too long.
+ *
+ * A table of WORDS rather than of labels: the catalogue has ~80 labels
+ * built from ~60 words, most of which repeat, and a word table also covers
+ * a label added later without anyone remembering to shorten it. */
+const M8_LABEL_WORDS = {
+    Amount: "Amt", Attack: "Atk", Color: "Col", Cutoff: "Cut",
+    Decay: "Dec", Degrade: "Degr", Delay: "Dly", Depth: "Dpt",
+    Detune: "Det", Feedback: "Fbk", Filter: "Flt", Highpass: "HP",
+    Input: "In", Length: "Len", Level: "Lvl", Lowpass: "LP",
+    ModFX: "MFX", Ratio: "Rat", Redux: "Rdx", Release: "Rel",
+    Resonance: "Res", Reverb: "Rev", Shift: "Shft", Shimmer: "Shmr",
+    Start: "Strt", Sustain: "Sus", Swarm: "Swrm", Timbre: "Tmb",
+    Track: "Trk", Value: "Val", Volume: "Vol", Width: "Wid",
+};
+
+/* "Input 2 Volume" -> "In 2 Vol" -> "In2 Vol", "Op A Level" -> "OpA Lvl".
+ * A bare index reads as part of the thing it indexes, so closing that gap
+ * buys a character and loses nothing. */
+const M8_LABEL_INDEX_RE = /\b(In|Op) ([0-9A-D])\b/g;
+
+function shortLabel(text) {
+    const words = String(text || "").split(" ");
+    for (let i = 0; i < words.length; i++) {
+        const short = M8_LABEL_WORDS[words[i]];
+        if (short) words[i] = short;
+    }
+    return words.join(" ").replace(M8_LABEL_INDEX_RE, "$1$2");
+}
+
 /* Name stem -> what that knob is, so a knob carrying no stored `detail`
  * can still be described.
  *
@@ -1140,12 +1177,29 @@ const M8_STEM_INDEX = (() => {
 /* Longest first, so "DEC" is not matched as "DE". */
 const M8_STEMS_BY_LENGTH = Object.keys(M8_STEM_INDEX).sort((a, b) => b.length - a.length);
 
+/* An instrument is always named with BOTH its hex digits - "Ins00",
+ * "Ins1A". A knob's own name drops the padding because a 32px cell cannot
+ * spare the character, which makes "CUT0" and "CUT10" look like different
+ * shapes of the same thing; the header has the room to be unambiguous, and
+ * the whole point of it is to say which instrument. */
+function instCtx(n) {
+    return `Ins${(Number(n) || 0).toString(16).toUpperCase().padStart(2, "0")}`;
+}
+
 /* What a knob is connected to: the recorded answer if there is one,
  * otherwise read back out of its name. A mod parameter is named for its
  * SLOT rather than its instrument (see m8KnobName), so a derived mod
  * detail can say "M2 Attack" but not which instrument - the recorded
- * one can, which is why it is still worth storing. */
+ * one can, which is why it is still worth storing.
+ *
+ * Stored LONG and abbreviated on the way out, so a detail recorded before
+ * the abbreviations existed shortens too, and so the wizard has one less
+ * thing to get right. */
 function knobDetail(knob) {
+    return shortLabel(knobDetailLong(knob));
+}
+
+function knobDetailLong(knob) {
     if (!knob) return "";
     if (knob.detail) return knob.detail;
     const name = String(knob.name || "");
@@ -1156,7 +1210,9 @@ function knobDetail(knob) {
         let ctx = "";
         if (entry.kind === "mix") ctx = "MIX";
         else if (entry.kind === "send") ctx = entry.ctx || "";
-        else if (entry.kind === "inst") ctx = suffix ? `I${suffix}` : "";
+        /* The suffix is the instrument's hex, unpadded, straight off the
+         * name - so it is parsed back rather than reprinted. */
+        else if (entry.kind === "inst") ctx = suffix ? instCtx(parseInt(suffix, 16)) : "";
         else if (entry.kind === "mod") ctx = suffix ? `M${suffix}` : "";
         return [ctx, entry.label].filter(Boolean).join(" ");
     }
@@ -1185,7 +1241,21 @@ function m8KnobName(stem, number) {
  * CCs are taken one at a time and AFTER each insertion, because nextFreeCc
  * reads the song: allocating a run up front would hand the same number to
  * every member of a group. */
-function addKnobsFromEntry(song, entry, number, target, vizMode, detail) {
+/* Each member of a group describes ITSELF. The group's own label names the
+ * picture ("Envelope (3 knobs)"), so handing it to all three members put
+ * that on the header of each of them - less use than the answer derived
+ * from the name would have been. modType()'s members carry no label, so
+ * the stem index is the fallback, which is the same table knobDetail reads
+ * and so cannot disagree with it. */
+function memberDetail(ctx, member, entry) {
+    const named = member.label
+        || (M8_STEM_INDEX[member.m] && M8_STEM_INDEX[member.m].label)
+        || (member === entry ? entry.label : "")
+        || member.m || "";
+    return [ctx, named].filter(Boolean).join(" ");
+}
+
+function addKnobsFromEntry(song, entry, number, target, vizMode, ctx) {
     /* A mode may replace the member list outright - different names and
      * a different order. See filterEntry's modeKnobs. */
     const members = (vizMode && entry.modeKnobs && entry.modeKnobs[vizMode])
@@ -1216,7 +1286,7 @@ function addKnobsFromEntry(song, entry, number, target, vizMode, detail) {
             name: m8KnobName(member.m, number),
             def: member.def,
             scale: member.scale,
-            detail,
+            detail: memberDetail(ctx, member, entry),
             viz: groupId ? { group: groupId, kind: entry.vizKind, role: member.role } : undefined,
         });
         /* The graphic's fixed setting - which filter type, which LFO wave -
@@ -2044,19 +2114,30 @@ function currentWizardFrame() {
     return knobWizardStack[knobWizardStack.length - 1] || null;
 }
 
+/* The innermost frame that HAS a context, not the innermost frame.
+ * The last step before a commit is often a plain picker that carries none
+ * - the track number for Mixer > Track Volume, the wave for an LFO - so
+ * reading the top of the stack dropped the context for exactly the entries
+ * that take an extra step, and did it silently. */
+function wizardCtx() {
+    for (let i = knobWizardStack.length - 1; i >= 0; i--) {
+        const ctx = knobWizardStack[i].ctx;
+        if (ctx) return ctx;
+    }
+    return "";
+}
+
 /* Commit a catalogue leaf and close. `number` is what gets appended to the
  * name - a track, an instrument, or a mod slot, depending on the path. */
 function commitWizardEntry(entry, number, vizMode) {
     const song = getActiveSong();
     if (song) {
-        const frame = currentWizardFrame();
-        /* "I1A Cutoff", "MIX Track Volume", "I1A M2 Envelope" - what the
-         * header spells out while the knob is touched. The 3-letter stem
-         * under the dial cannot say which instrument or which mod slot,
-         * and that is the thing worth knowing. */
-        const detail = [(frame && frame.ctx) || "", entry.label || entry.m || ""]
-            .filter(Boolean).join(" ");
-        addKnobsFromEntry(song, entry, number, knobWizardTarget, vizMode, detail);
+        /* "Ins1A Cutoff", "MIX Track Volume", "Ins1A M2 Attack" - what the
+         * header spells out while the knob is touched, abbreviated on the
+         * way to the screen by knobDetail. The 3-letter stem under the
+         * dial cannot say which instrument or which mod slot, and that is
+         * the thing worth knowing. */
+        addKnobsFromEntry(song, entry, number, knobWizardTarget, vizMode, wizardCtx());
     }
     closeKnobWizard();
 }
@@ -2113,8 +2194,40 @@ function paramListFrame(title, params, number, ctx) {
         ctx);
 }
 
+/* The root's first entry: everything that does not need to be told which
+ * instrument it belongs to.
+ *
+ * "Knob" is the old "Other" - a knob the catalogue has no opinion about,
+ * which you name yourself and which takes the next free CC like any other.
+ * It sat alone at the BOTTOM of the root list, which is the wrong end for
+ * the entry a new user reaches for first.
+ *
+ * The mod types are here for a reason rather than for convenience: a mod
+ * parameter is named and numbered by its SLOT, so the instrument step
+ * above them was two clicks that changed nothing about the resulting
+ * knob. Instrument > Mods still exists for the one thing it does add,
+ * which is recording the instrument for the header. */
+function genericFrame() {
+    const entries = [
+        { name: "Knob", open: () => openOtherKnobEntry() },
+    ];
+    /* The type is chosen HERE and the slot after it, which is the reverse
+     * of Instrument > Mods - the type is what the user came to this list
+     * for, so the slot frame is reused with its type step pre-answered
+     * rather than asking for the same thing twice. */
+    for (const t of M8_MOD_TYPES) {
+        entries.push({ name: t.name, open: () => pushWizardFrame(modSlotFrame("", t)) });
+    }
+    return listFrame(
+        "Generic", entries,
+        (e) => e.name,
+        () => "",
+        (e) => e.open());
+}
+
 function rootWizardFrame() {
     const groups = [
+        { name: "Generic", open: () => pushWizardFrame(genericFrame()) },
         {
             name: "Instrument",
             open: () => pushWizardFrame({
@@ -2132,39 +2245,47 @@ function rootWizardFrame() {
                 (g) => String(g.params.length),
                 (g) => pushWizardFrame(paramListFrame(g.name, g.params, undefined, g.ctx)))),
         },
-        /* "Other" adds a knob the catalogue has no opinion about: you name
-         * it, and it takes the next free CC like any other. For an M8
-         * parameter this module does not know, or a mapping to something
-         * else entirely on the same channel. */
-        { name: "Other", open: () => openOtherKnobEntry() },
     ];
     return listFrame("Add Knob", groups, (g) => g.name, () => "", (g) => g.open());
 }
 
+/* Mods are numbered by SLOT, so they are the one instrument category that
+ * does not actually need the instrument - which is why they are offered
+ * both here (recording which instrument, for the header) and at the root
+ * under Generic (two steps shorter). */
+function modSlotFrame(ctx, fixedType) {
+    return listFrame(
+        fixedType ? fixedType.name : "Mod Slot", [1, 2, 3, 4],
+        (n) => `Mod ${n}`,
+        () => "",
+        (n) => {
+            const slotCtx = [ctx, `M${n}`].filter(Boolean).join(" ");
+            if (fixedType) {
+                pushWizardFrame(paramListFrame(fixedType.name, fixedType.params, n, slotCtx));
+                return;
+            }
+            pushWizardFrame(listFrame(
+                `Mod ${n}`, M8_MOD_TYPES,
+                (t) => t.name,
+                () => "",
+                (t) => pushWizardFrame(paramListFrame(t.name, t.params, n, slotCtx)),
+                slotCtx));
+        },
+        ctx);
+}
+
 function instrumentFrame(instrument) {
     const label = instrument.toString(16).toUpperCase().padStart(2, "0");
-    const ctx = `I${label}`;
+    const ctx = instCtx(instrument);
     const categories = [
         {
             name: "Generic",
             open: () => pushWizardFrame(
                 paramListFrame("Generic", M8_INSTRUMENT_GENERIC, instrument, ctx)),
         },
-        {
-            name: "Mods",
-            open: () => pushWizardFrame(listFrame(
-                "Mod Slot", [1, 2, 3, 4],
-                (n) => `Mod ${n}`,
-                () => "",
-                (n) => pushWizardFrame(listFrame(
-                    `Mod ${n}`, M8_MOD_TYPES,
-                    (t) => t.name,
-                    () => "",
-                    /* The mod SLOT, not the instrument, numbers a mod
-                     * parameter's name - see m8KnobName. */
-                    (t) => pushWizardFrame(paramListFrame(t.name, t.params, n, `${ctx} M${n}`)),
-                    `${ctx} M${n}`)))),
-        },
+        /* The mod SLOT, not the instrument, numbers a mod parameter's
+         * name - see m8KnobName. */
+        { name: "Mods", open: () => pushWizardFrame(modSlotFrame(ctx)) },
         {
             name: "Instrument Type",
             open: () => pushWizardFrame(listFrame(
@@ -2186,7 +2307,9 @@ function typeParamsFor(type) {
     return [filterEntry(type.filterTypes)].concat(type.params);
 }
 
-/* "Other": straight to the keyboard, and the typed text IS the name. */
+/* Generic > Knob: straight to the keyboard, and the typed text IS the
+ * name. For an M8 parameter this module does not know, or a mapping to
+ * something else entirely on the same channel. */
 function openOtherKnobEntry() {
     openTextEntry({
         title: "Knob Name",
@@ -2201,7 +2324,7 @@ function openOtherKnobEntry() {
 /* ---------------------------------------------------------- wizard input */
 
 function handleKnobWizardInput(data) {
-    /* "Other" hands the pads to text_entry.mjs; it owns everything until it
+    /* Generic > Knob hands the pads to text_entry.mjs; it owns everything until it
      * confirms or cancels. A cancel leaves the wizard standing on the group
      * list, which is where Back would have put it anyway. */
     if (isTextEntryActive()) {
