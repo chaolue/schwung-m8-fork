@@ -641,7 +641,7 @@ function filterEntry(types) {
         vizModeOptions: types,
         vizModePrompt: "Filter Type",
         modeKnobs: {
-            "LP>HP": [
+            [FILTER_LP_HP]: [
                 { m: "HP", label: "Highpass", def: 0x00, role: "resonance" },
                 { m: "LP", label: "Lowpass", def: 0xFF, role: "cutoff" },
             ],
@@ -669,13 +669,32 @@ function filterEntry(types) {
  * own copy of the fill, because a filter that fills differently from the
  * envelope beside it can misrepresent the filter. Until such a mode
  * exists, no picture beats a wrong one. */
+/* Written the way a person reads them rather than the way M8's screen
+ * abbreviates them - the M8 is squeezing these into a hardware font and
+ * we are not. They still have to be M8's words: viz_draw's filterModeOf
+ * reads the selected option's TEXT to pick a response curve, so
+ * "Bandstop" is a decision and not a spelling.
+ *
+ * LP > HP keeps its abbreviation on purpose. filterModeOf recognises the
+ * pair only through a ">" (`lp\s*>\s*hp` or `lowpass\s*>\s*highpass`);
+ * anything else containing both words - "LP to HP" - falls through to
+ * the rule below it and is drawn as a BANDPASS, which is the wrong
+ * corner and a resonant peak the filter does not have. The spelt-out
+ * form matches too but is too long for a menu row. */
+/* Declared up here rather than beside M8_FILTER_TYPES, which is where
+ * they read naturally: VIZ_MODE_WAS below is keyed by FILTER_LP_HP, and
+ * a const is in its temporal dead zone until its own line runs - so the
+ * module threw on import, which `node --check` cannot see. */
+const FILTER_OFF = "Off";
+const FILTER_LP_HP = "LP > HP";
+
 /* Shape ids for the three waveforms Schwung gained for M8's sake (see
  * the viz-lfo-exponential-and-square-up branch). An OLDER Schwung has no
  * case for them and lfoShapeSample falls through to its sine default, so
  * sampling one against a sine is a reliable way to ask whether this
  * host can draw it - and cheaper than shipping two builds of the
  * module or guessing from a version number. */
-const LFO_SHAPE_PROBE = { "EXP DN": 100, "EXP UP": 101, "SQU UP": 102 };
+const LFO_SHAPE_PROBE = { "Exp Down": 100, "Exp Up": 101, "Square Up": 102 };
 
 function libraryDrawsShape(id) {
     /* Two probe points, because a single one can coincide: an inverted
@@ -692,24 +711,45 @@ function libraryDrawsLpHp() {
     return filterGainAt(0.2, "lphp", 0.8, 0.5) !== filterGainAt(0.2, "lp", 0.8, 0.5);
 }
 
-const VIZ_UNSUPPORTED_MODES = (libraryDrawsLpHp() ? [] : ["LP>HP"]).concat(
-    /* An exponential drawn as a ramp is the wrong curve, and SQU UP drawn
-     * as the only square would be inverted - showing the LFO high exactly
-     * when it is low. So on a host that cannot draw them, they get plain
-     * dials; on one that can, they get their real waveform. */
-    Object.keys(LFO_SHAPE_PROBE).filter((name) => !libraryDrawsShape(LFO_SHAPE_PROBE[name]))
-);
-
-/* M8's shape names against the ones viz_draw matches on. The picker keeps
- * M8's own spelling; what gets STORED (and read by the viz layer) is the
- * right-hand side. "RAMP DN" missing by two letters is why it drew a
- * sine: lfoShapeIdOf matches whole words and an unrecognised name falls
- * through to sine rather than failing, so a wrong name is invisible. */
-const M8_LFO_SHAPE_ALIASES = {
-    "RAMP DN": "RAMP DOWN",
-    /* The library's one square starts high, which IS M8's SQU DN. */
-    "SQU DN": "SQUARE",
+/* The spellings these modes were STORED under before the names were
+ * written out. This check runs against a saved song, so a rename that
+ * forgot them would quietly start drawing a wrong curve for every group
+ * created before it - and drawing the wrong curve is the exact failure
+ * the unsupported list exists to prevent. */
+const VIZ_MODE_WAS = {
+    [FILTER_LP_HP]: ["LP>HP"],
+    "Exp Down": ["EXP DN"],
+    "Exp Up": ["EXP UP"],
+    "Square Up": ["SQU UP"],
 };
+
+/* Compared on a squashed key, so punctuation and spacing cannot make two
+ * spellings of one mode look different - "LP > HP" and "LP>HP" are the
+ * same answer. */
+function vizModeKey(text) {
+    return String(text || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+const VIZ_UNSUPPORTED_KEYS = (() => {
+    const keys = new Set();
+    const mark = (name) => {
+        keys.add(vizModeKey(name));
+        for (const old of VIZ_MODE_WAS[name] || []) keys.add(vizModeKey(old));
+    };
+    if (!libraryDrawsLpHp()) mark(FILTER_LP_HP);
+    /* An exponential drawn as a ramp is the wrong curve, and Square Up
+     * drawn as the only square would be inverted - showing the LFO high
+     * exactly when it is low. So on a host that cannot draw them, they
+     * get plain dials; on one that can, they get their real waveform. */
+    for (const name of Object.keys(LFO_SHAPE_PROBE)) {
+        if (!libraryDrawsShape(LFO_SHAPE_PROBE[name])) mark(name);
+    }
+    return keys;
+})();
+
+function vizModeUnsupported(mode) {
+    return !!mode && VIZ_UNSUPPORTED_KEYS.has(vizModeKey(mode));
+}
 
 /* M8's filter types, in the order the Multi-mode Filter Parameters section
  * lists them, plus the OFF the Instrument View screenshot shows as default.
@@ -728,14 +768,14 @@ const M8_LFO_SHAPE_ALIASES = {
 const M8_NOTE_SCALE = 0x7F;
 
 const M8_FILTER_TYPES = [
-    "OFF", "LOWPASS", "HIGHPASS", "BANDPASS", "BANDSTOP",
-    "LP>HP", "ZDF LOWPASS", "ZDF HIGHPASS",
+    FILTER_OFF, "Lowpass", "Highpass", "Bandpass", "Bandstop",
+    FILTER_LP_HP, "ZDF Lowpass", "ZDF Highpass",
 ];
 
 /* Wavsynth adds four modes that apply the filter INTO the waveform. Only
  * offered under Wavsynth, so the other types' lists stay honest. */
 const M8_FILTER_TYPES_WAVSYNTH = M8_FILTER_TYPES.concat([
-    "WAV LOWPASS", "WAV HIGHPASS", "WAV BANDPASS", "WAV BANDSTOP",
+    "Wav Lowpass", "Wav Highpass", "Wav Bandpass", "Wav Bandstop",
 ]);
 
 /* The LFO shapes the Instrument Modulation View lists, in its order. Like
@@ -744,9 +784,19 @@ const M8_FILTER_TYPES_WAVSYNTH = M8_FILTER_TYPES.concat([
  * matters more than it looks. The "T" (tick-rate) variants of each shape
  * are the same WAVE at a faster rate, so they are left out: they would
  * double the list without changing a single picture. */
+/* Spelt out, for the same reason as the filter types - and with a bonus:
+ * these names are lfoShapeIdOf's OWN vocabulary, so nothing has to be
+ * translated on the way to storage any more. M8's abbreviations did not
+ * match it ("RAMP DN" missed `rampdown` by two letters and silently drew
+ * a sine), which is what the alias table used to paper over.
+ *
+ * "Square Down" is deliberate, not a typo for the library's plain
+ * "square": viz_draw's one square starts HIGH, which is exactly what M8
+ * calls SQU DN, and `squaredown` is matched to it. Square Up is the
+ * separate shape added for M8's sake. */
 const M8_LFO_SHAPES = [
-    "TRI", "SIN", "RAMP DN", "RAMP UP", "EXP DN", "EXP UP",
-    "SQU DN", "SQU UP", "RANDOM", "DRUNK",
+    "Triangle", "Sine", "Ramp Down", "Ramp Up", "Exp Down", "Exp Up",
+    "Square Down", "Square Up", "Random", "Drunk",
 ];
 
 /* ---------------------------------------------------------------- mixer */
@@ -1060,8 +1110,8 @@ const M8_MOD_TYPES = [
  * They stay in the TYPE picker under Instrument, where the choice is the
  * M8 parameter rather than the graphic. */
 const VIZ_SAME_AS_TYPE = {
-    "ZDF LOWPASS": "LOWPASS",
-    "ZDF HIGHPASS": "HIGHPASS",
+    "ZDF Lowpass": "Lowpass",
+    "ZDF Highpass": "Highpass",
 };
 
 function fixedModeEntry(base, label, mode) {
@@ -1097,7 +1147,7 @@ const M8_GENERIC_SHAPES = (() => {
      * through Instrument. */
     const filter = filterEntry(M8_FILTER_TYPES);
     for (const t of M8_FILTER_TYPES) {
-        if (VIZ_SAME_AS_TYPE[t] || t === "OFF") continue;
+        if (VIZ_SAME_AS_TYPE[t] || t === FILTER_OFF) continue;
         out.push(fixedModeEntry(filter, `Filter ${t}`, t));
     }
     const lfo = M8_MOD_TYPES.find((t) => t.name === "LFO");
@@ -1399,9 +1449,9 @@ function addKnobsFromEntry(song, entry, number, target, vizMode, ctx) {
      * that fails the adjacency check and draws nothing. */
     const groupId = entry.vizKind ? `g${makeSongId()}` : null;
 
-    /* Stored in the vocabulary the viz layer matches on, which is not
-     * always the one the picker showed - see M8_LFO_SHAPE_ALIASES. */
-    const storedMode = (vizMode && M8_LFO_SHAPE_ALIASES[vizMode]) || vizMode;
+    /* Stored verbatim: the option names ARE the vocabulary viz_draw
+     * matches on, which is what the readable spellings bought. */
+    const storedMode = vizMode;
 
     members.forEach((member, i) => {
         const slot = place.slot + i;
@@ -1446,7 +1496,7 @@ function connectKnobsFromEntry(song, entry, number, vizMode, ctx, index) {
     if (!page || !page.knobs[index]) return;
     const block = knobMoveBlock(page, index);
     const members = entryMembers(entry, vizMode);
-    const storedMode = (vizMode && M8_LFO_SHAPE_ALIASES[vizMode]) || vizMode;
+    const storedMode = vizMode;
 
     /* Reuse the group id if there is one, so a connected envelope stays
      * the same picture rather than becoming a second group over the same
@@ -2720,12 +2770,12 @@ function ensureSongPageMeta(song, pageIndex, page) {
     }
 
     /* Groups whose fixed setting has no honest picture - see
-     * VIZ_UNSUPPORTED_MODES. Declaring no viz leaves the members as
+     * vizModeUnsupported. Declaring no viz leaves the members as
      * ordinary labelled dials. */
     const unsupported = new Set();
     for (const k of page.knobs) {
         if (!k || !k.viz || !k.viz.group || !k.vizMode) continue;
-        if (VIZ_UNSUPPORTED_MODES.indexOf(k.vizMode) >= 0) unsupported.add(k.viz.group);
+        if (vizModeUnsupported(k.vizMode)) unsupported.add(k.viz.group);
     }
 
     cachedChainParams = page.knobs.map((k, i) => {
