@@ -776,11 +776,17 @@ function filterEntry(types) {
              * looks exactly like a drawing bug and is not one.
              *
              * So the first knob must be learned to RES and the second to
-             * CUT. The help says so, and touching a knob names the
-             * parameter in the header. */
+             * CUT. These are the only two knobs in the catalogue whose
+             * label NAMES the M8 parameter as well as the role, because
+             * they are the only two where the label and the parameter
+             * are different words and getting the pair round the wrong
+             * way is silent: it looks like the picture is mirrored, not
+             * like a mapping mistake. Touch the knob and the header
+             * reads "Ins02 HP (RES)", which is the answer at the moment
+             * you need it. */
             [FILTER_LP_HP]: [
-                { m: "HP", label: "Highpass", def: 0x00, role: "resonance" },
-                { m: "LP", label: "Lowpass", def: 0xFF, role: "cutoff" },
+                { m: "HP", label: "Highpass (RES)", def: 0x00, role: "resonance" },
+                { m: "LP", label: "Lowpass (CUT)", def: 0xFF, role: "cutoff" },
             ],
         },
         knobs: [
