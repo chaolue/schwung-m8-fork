@@ -746,6 +746,7 @@ const M8_MIXER_PARAMS = [
 const M8_SEND_GROUPS = [
     {
         name: "ModFX",
+        ctx: "MFX",
         params: [
             { m: "XMM", label: "Mod Depth", def: 0x40 },
             { m: "XMF", label: "Mod Freq", def: 0x80 },
@@ -755,6 +756,7 @@ const M8_SEND_GROUPS = [
     },
     {
         name: "Delay",
+        ctx: "DLY",
         params: [
             { m: "XDL", label: "Time L", def: 0x30 },
             { m: "XDR", label: "Time R", def: 0x30 },
@@ -765,6 +767,7 @@ const M8_SEND_GROUPS = [
     },
     {
         name: "Reverb",
+        ctx: "REV",
         params: [
             { m: "XRS", label: "Room Size", def: 0xFF },
             { m: "XRD", label: "Decay", def: 0xC0 },
@@ -1009,6 +1012,9 @@ function makeKnobConfig(cc, opts) {
      * unchanged and every song written before this still loads as
      * byte-scaled - which is what all of them are. */
     if (noteScaled) knob.scale = M8_NOTE_SCALE;
+    /* What the wizard was pointing at when this knob was made - shown in
+     * the header while the knob is touched. See commitWizardEntry. */
+    if (o.detail) knob.detail = o.detail;
     /* Membership of a multi-knob graphic: which group, what it draws, and
      * this knob's part in it (viz.mjs's role vocabulary). */
     if (o.viz) knob.viz = o.viz;
@@ -1107,7 +1113,7 @@ function m8KnobName(stem, number) {
  * CCs are taken one at a time and AFTER each insertion, because nextFreeCc
  * reads the song: allocating a run up front would hand the same number to
  * every member of a group. */
-function addKnobsFromEntry(song, entry, number, target, vizMode) {
+function addKnobsFromEntry(song, entry, number, target, vizMode, detail) {
     /* A mode may replace the member list outright - different names and
      * a different order. See filterEntry's modeKnobs. */
     const members = (vizMode && entry.modeKnobs && entry.modeKnobs[vizMode])
@@ -1138,6 +1144,7 @@ function addKnobsFromEntry(song, entry, number, target, vizMode) {
             name: m8KnobName(member.m, number),
             def: member.def,
             scale: member.scale,
+            detail,
             viz: groupId ? { group: groupId, kind: entry.vizKind, role: member.role } : undefined,
         });
         /* The graphic's fixed setting - which filter type, which LFO wave -
@@ -1942,10 +1949,22 @@ function closeKnobWizard() {
     updateMoveViewPulse();
 }
 
+/* Each frame carries the CONTEXT the path has narrowed to so far - "MIX",
+ * "REV", "I1A", "I1A M2" - inherited from its parent unless it narrows
+ * further. It ends up on the knob as `detail` and is what the header
+ * shows while the knob is touched, because a name like CUT1A says which
+ * instrument only if you already know the scheme.
+ *
+ * Kept on the FRAME rather than in one variable so Back unwinds it for
+ * free: popping to the parent restores the parent's context. */
 function pushWizardFrame(frame) {
     if (!frame) return;
     frame.cursor = 0;
     if (frame.kind === WIZ_HEX) frame.editing = -1;
+    if (frame.ctx === undefined) {
+        const parent = currentWizardFrame();
+        frame.ctx = parent ? parent.ctx : "";
+    }
     knobWizardStack.push(frame);
 }
 
@@ -1957,7 +1976,16 @@ function currentWizardFrame() {
  * name - a track, an instrument, or a mod slot, depending on the path. */
 function commitWizardEntry(entry, number, vizMode) {
     const song = getActiveSong();
-    if (song) addKnobsFromEntry(song, entry, number, knobWizardTarget, vizMode);
+    if (song) {
+        const frame = currentWizardFrame();
+        /* "I1A Cutoff", "MIX Track Volume", "I1A M2 Envelope" - what the
+         * header spells out while the knob is touched. The 3-letter stem
+         * under the dial cannot say which instrument or which mod slot,
+         * and that is the thing worth knowing. */
+        const detail = [(frame && frame.ctx) || "", entry.label || entry.m || ""]
+            .filter(Boolean).join(" ");
+        addKnobsFromEntry(song, entry, number, knobWizardTarget, vizMode, detail);
+    }
     closeKnobWizard();
 }
 
@@ -1979,8 +2007,8 @@ function pickEntry(entry, number) {
 
 /* --------------------------------------------------------- wizard frames */
 
-function listFrame(title, items, getLabel, getValue, onPick) {
-    return { kind: WIZ_LIST, title, items, getLabel, getValue, onPick };
+function listFrame(title, items, getLabel, getValue, onPick, ctx) {
+    return { kind: WIZ_LIST, title, items, getLabel, getValue, onPick, ctx };
 }
 
 /* A catalogue leaf's right-hand column: the name the knob will end up with,
@@ -1992,7 +2020,7 @@ function entryPreview(entry, number) {
     return m8KnobName(entry.m, number);
 }
 
-function paramListFrame(title, params, number) {
+function paramListFrame(title, params, number, ctx) {
     return listFrame(
         title, params,
         (p) => p.label,
@@ -2009,7 +2037,8 @@ function paramListFrame(title, params, number) {
                 return;
             }
             pickEntry(p, number);
-        });
+        },
+        ctx);
 }
 
 function rootWizardFrame() {
@@ -2019,16 +2048,17 @@ function rootWizardFrame() {
             open: () => pushWizardFrame({
                 kind: WIZ_HEX, title: "Instrument", value: 0,
                 onPick: (n) => { knobWizardInstrument = n; pushWizardFrame(instrumentFrame(n)); },
+                ctx: "",
             }),
         },
-        { name: "Mixer", open: () => pushWizardFrame(paramListFrame("Mixer", M8_MIXER_PARAMS)) },
+        { name: "Mixer", open: () => pushWizardFrame(paramListFrame("Mixer", M8_MIXER_PARAMS, undefined, "MIX")) },
         {
             name: "Sends",
             open: () => pushWizardFrame(listFrame(
                 "Sends", M8_SEND_GROUPS,
                 (g) => g.name,
                 (g) => String(g.params.length),
-                (g) => pushWizardFrame(paramListFrame(g.name, g.params)))),
+                (g) => pushWizardFrame(paramListFrame(g.name, g.params, undefined, g.ctx)))),
         },
         /* "Other" adds a knob the catalogue has no opinion about: you name
          * it, and it takes the next free CC like any other. For an M8
@@ -2041,11 +2071,12 @@ function rootWizardFrame() {
 
 function instrumentFrame(instrument) {
     const label = instrument.toString(16).toUpperCase().padStart(2, "0");
+    const ctx = `I${label}`;
     const categories = [
         {
             name: "Generic",
             open: () => pushWizardFrame(
-                paramListFrame("Generic", M8_INSTRUMENT_GENERIC, instrument)),
+                paramListFrame("Generic", M8_INSTRUMENT_GENERIC, instrument, ctx)),
         },
         {
             name: "Mods",
@@ -2059,7 +2090,8 @@ function instrumentFrame(instrument) {
                     () => "",
                     /* The mod SLOT, not the instrument, numbers a mod
                      * parameter's name - see m8KnobName. */
-                    (t) => pushWizardFrame(paramListFrame(t.name, t.params, n)))))),
+                    (t) => pushWizardFrame(paramListFrame(t.name, t.params, n, `${ctx} M${n}`)),
+                    `${ctx} M${n}`)))),
         },
         {
             name: "Instrument Type",
@@ -2068,10 +2100,10 @@ function instrumentFrame(instrument) {
                 (t) => t.name,
                 (t) => String(t.params.length),
                 (t) => pushWizardFrame(
-                    paramListFrame(t.name, typeParamsFor(t), instrument)))),
+                    paramListFrame(t.name, typeParamsFor(t), instrument, ctx)))),
         },
     ];
-    return listFrame(`Inst ${label}`, categories, (c) => c.name, () => "", (c) => c.open());
+    return listFrame(`Inst ${label}`, categories, (c) => c.name, () => "", (c) => c.open(), ctx);
 }
 
 /* A type's own parameters, plus its filter graphic when the type widens the
@@ -2525,8 +2557,16 @@ function drawSongPage() {
 
     clear_screen();
 
+    /* The header's right-hand slot, which is otherwise unused - our pages
+     * carry no name. drawHeader gives it first claim on the width and
+     * fits it, so a long detail truncates rather than colliding with the
+     * song name on the left. */
+    const activeKnob = (activeKnobIndex >= 0 && isKnobReadoutActive(activeKnobIndex))
+        ? page.knobs[activeKnobIndex] : null;
+    const headerRight = (activeKnob && activeKnob.detail) || page.name || "";
+
     renderPage(songPageDrawCtx, {
-        page: { name: page.name || "", keys: pageKeys },
+        page: { name: headerRight, keys: pageKeys },
         metaIndex: cachedMetaIndex,
         values,
         viz,
