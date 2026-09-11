@@ -3555,7 +3555,12 @@ globalThis.init = function () {
     /* Armed here, but the first screen is logged from markM8Connected:
      * the settings are not read until then, and there is no screen to
      * describe until the M8 is talking. */
-    traceOn = !!std.loadFile(tracePath("trace_on"));
+    /* `!= null`, not a truthiness test: the natural way to create a flag
+     * file is `touch`, which leaves it EMPTY, and loadFile returns "" for
+     * that - so the obvious gesture armed nothing. It read as "the
+     * feature does not work" rather than as "the flag did not take",
+     * which cost a diagnostic round trip. */
+    traceOn = std.loadFile(tracePath("trace_on")) != null;
 
     /* Proactively send LPP identity on startup - this handles the case where
      * M8 sent its identity request before the module loaded. The M8 will
