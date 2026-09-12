@@ -169,7 +169,12 @@ const RGB_WHITE = 120;         /* #FFFFFF */
  * which was which. Amber is the one hue nothing else on this surface
  * uses: the M8's own palette runs white, pink, green, blue and red. */
 const RGB_PRESET = 8;          /* #FFC516 bright yellow */
-const RGB_PRESET_DIM = 79;     /* #664E08 - its own dim variant */
+/* Not amber's own dim variant, 79 (#664E08): beside the bright one it
+ * still read as the same lamp at the same strength, and which song you
+ * were on took a second look. Ochre is a long way down in luminance
+ * while still being clearly lit - the row has to survive a lit room,
+ * which is what ruled out the darker 80 (#211902). */
+const RGB_PRESET_DIM = 6;      /* #491804 ochre */
 
 /* Kept for the LPP colour map below, which addresses pads only. */
 /* Only the LPP colour map uses these two now, and only as MOVE PALETTE
