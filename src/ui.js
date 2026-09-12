@@ -736,11 +736,15 @@ function routeTextEntryInput(data) {
     return true;
 }
 
-function updateMoveViewPulse() {
-    setButtonLED(moveBACK, ledFor(moveBACK, "dim"));
-    setButtonLED(moveMENU, ledFor(moveMENU, "dim"));
-    setButtonLED(moveCAP, ledFor(moveCAP, "dim"));
-    setButtonLED(currentView, ledFor(currentView, "bright"));
+/* `force` pushes past setButtonLED's cache, which otherwise suppresses
+ * a repeat of a value it believes it already sent - and after the
+ * host's LED clear that belief is wrong for every button on the
+ * surface. Re-asserting without it is a no-op. */
+function updateMoveViewPulse(force) {
+    setButtonLED(moveBACK, ledFor(moveBACK, "dim"), force);
+    setButtonLED(moveMENU, ledFor(moveMENU, "dim"), force);
+    setButtonLED(moveCAP, ledFor(moveCAP, "dim"), force);
+    setButtonLED(currentView, ledFor(currentView, "bright"), force);
     /* Which view you are in, as an animation on the view button: Top is
      * steady, Bottom pulses, Odd blinks faster. The channel nibble of the
      * status byte picks the animation (see constants.mjs - 0xA is
@@ -812,6 +816,37 @@ const PAD_REASSERT_TICKS = 150;
 const PAD_REASSERT_EVERY = 30;
 let padReassert = 0;
 
+/* ASKING THE M8 TO PAINT, when replaying the cache cannot help.
+ *
+ * Leaving the module does not tell the M8 anything - it goes on
+ * believing a Launchpad is attached - so on the way back in it has no
+ * reason to send its grid again, and this time there is no cache to
+ * replay either, the module having been reloaded. The pads stay dark
+ * until something makes the M8 talk, which is why pressing a button or
+ * changing page fixes it, and why power-cycling the M8 first avoids it
+ * altogether.
+ *
+ * So if nothing at all has arrived a second after connecting, the
+ * module presses Session on the M8's behalf. That is the cheapest
+ * thing that makes it repaint, and it lands where the module already
+ * assumes it is: lpMode starts at LP_SESSION, and the M8's own start
+ * screen is Session.
+ *
+ * Conditional on having heard NOTHING, so an M8 that did repaint on
+ * its own is left alone and nobody's screen changes under them. */
+const M8_NUDGE_TICKS = 60;
+const LPP_SESSION_NOTE = 93;
+let m8NudgeTicks = 0;
+let ledsSeenSinceConnect = 0;
+
+function tickM8Nudge() {
+    if (m8NudgeTicks <= 0) return;
+    if (--m8NudgeTicks > 0) return;
+    if (ledsSeenSinceConnect > 0) return;
+    move_midi_external_send([2 << 4 | 0x9, 0x90, LPP_SESSION_NOTE, 100]);
+    move_midi_external_send([2 << 4 | 0x8, 0x80, LPP_SESSION_NOTE, 0]);
+}
+
 function tickPadReassert() {
     if (padReassert <= 0) return;
     /* Tested BEFORE the decrement, so the first sweep goes out on the
@@ -820,11 +855,26 @@ function tickPadReassert() {
     const due = padReassert % PAD_REASSERT_EVERY === 0;
     padReassert--;
     if (!due) return;
-    /* The buttons down the sides come from the same cache and were
-     * cleared by the same sweep. */
+    /* queuePadRedraw only covers the PADS - its entries come from the
+     * pad map. The buttons down the sides, Play and the logo travel
+     * through the CONTROL map and were cleared by the same sweep, so
+     * they need replaying too. */
     queuePadRedraw();
-    updateMoveViewPulse();
-    updatePLAYLed();
+    reassertControlLeds();
+    updateMoveViewPulse(true);
+    updatePLAYLed(true);
+}
+
+/* Repaint every side button, and the logo, from what the M8 last said
+ * about it. These are raw CC writes inside applyLppLed rather than
+ * cached ones, so replaying the remembered message is enough. A
+ * control the M8 has never lit is left alone: some of them are the
+ * module's own and updateMoveViewPulse owns those. */
+function reassertControlLeds() {
+    for (const lppNote of controlMapMoveToLpp().values()) {
+        const data = lppNoteValueMap.get(lppNote);
+        if (data && data[0] !== 0) applyLppLed(data[1], data[2], data[0] & 0xF0, data[0]);
+    }
 }
 
 /* Pressing one of those buttons switches song. Silent for a button with
@@ -840,11 +890,11 @@ function selectSongByStep(index) {
     updateSongStepLeds();
 }
 
-function updatePLAYLed() {
-    if (!liveMode && !isPlaying) setButtonLED(movePLAY, ledFor(movePLAY, "bright"));
-    if (!liveMode && isPlaying) setButtonLED(movePLAY, green);
-    if (liveMode && !isPlaying) setButtonLED(movePLAY, sky);
-    if (liveMode && isPlaying) setButtonLED(movePLAY, navy);
+function updatePLAYLed(force) {
+    if (!liveMode && !isPlaying) setButtonLED(movePLAY, ledFor(movePLAY, "bright"), force);
+    if (!liveMode && isPlaying) setButtonLED(movePLAY, green, force);
+    if (liveMode && !isPlaying) setButtonLED(movePLAY, sky, force);
+    if (liveMode && isPlaying) setButtonLED(movePLAY, navy, force);
 }
 
 function sendLPPIdentity() {
@@ -874,6 +924,8 @@ function markM8Connected() {
     updateSongStepLeds(true);
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
     padReassert = PAD_REASSERT_TICKS;
+    ledsSeenSinceConnect = 0;
+    m8NudgeTicks = M8_NUDGE_TICKS;
 }
 
 function initLPP() {
@@ -3554,6 +3606,7 @@ globalThis.onMidiMessageExternal = function (data) {
     markM8Connected();
 
     lppNoteValueMap.set(data[1], [...data]);
+    ledsSeenSinceConnect++;
     traceLed(data[1], data[2], noteOn, value);
     applyLppLed(data[1], data[2], maskedValue, value);
 };
@@ -3910,6 +3963,7 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
+    tickM8Nudge();
     tickPadReassert();
     tickPadAnimation();
     drainPadRedraw();
