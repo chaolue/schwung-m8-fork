@@ -12,7 +12,7 @@ import {
     MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete,
     MoveMainButton, MoveMainTouch, MoveMainKnob, MoveMasterTouch,
     MovePlay, MoveRec, MoveLoop, MoveMute, MoveUndo,
-    MovePad32, MidiClock, MoveRGBLeds
+    MovePad32, MidiClock, MoveRGBLeds, MoveUp, MoveDown
 } from '/data/UserData/schwung/shared/constants.mjs';
 import { setLED, setButtonLED, decodeDelta } from '/data/UserData/schwung/shared/input_filter.mjs';
 import { buildMetaIndex } from '/data/UserData/schwung/shared/param_pages/param_meta.mjs';
@@ -1141,6 +1141,12 @@ const DEFAULT_SETTINGS = {
     masterChannel: 3,
     masterCc: 79,
     masterMode: KNOB_MODE_ABSOLUTE,
+    /* Where the master knob was left. Kept with the settings rather
+     * than in a song because the knob belongs to no song, and kept at
+     * all so the readout starts where you left it instead of at zero
+     * every time the module loads. Restored but NOT sent: pushing a
+     * value at the M8 on load would move a parameter nobody touched. */
+    masterValue: 0,
     /* Adds a third stop to the wheel-touch view cycle - see ODD_ROWS. */
     oddRows: false,
 };
@@ -3539,7 +3545,7 @@ function drawSlotLabel(slot, text, inverted) {
 const MASTER_OVERLAY_H = 17;
 
 function drawMasterOverlay() {
-    const label = "Main " + (masterKnobValue * 2).toString(16).toUpperCase().padStart(2, "0");
+    const label = "Main " + (settings.masterValue * 2).toString(16).toUpperCase().padStart(2, "0");
     const w = Math.min(SCREEN_WIDTH - 8, text_width(label) + 18);
     const x = Math.round((SCREEN_WIDTH - w) / 2);
     const y = 24;
@@ -3804,8 +3810,9 @@ function handleSongKnobTurn(data) {
 
 /* CC79 (master) pass-through - see the comment at its call site. Not part of
  * any song's data, just forwards its own value; its only appearance on
- * screen is the transient panel drawn by drawMasterOverlay. */
-let masterKnobValue = 0;
+ * screen is the transient panel drawn by drawMasterOverlay. The value
+ * itself lives in `settings` so it survives a reload - see masterValue
+ * in DEFAULT_SETTINGS. */
 /* Where the master knob stood when a Shift audition began, or null. */
 let masterAuditionValue = null;
 
@@ -3816,15 +3823,17 @@ function sendMasterValue(wire) {
 
 function revertMasterAudition() {
     if (masterAuditionValue === null) return;
-    const delta = masterAuditionValue - masterKnobValue;
-    masterKnobValue = masterAuditionValue;
+    const delta = masterAuditionValue - settings.masterValue;
+    settings.masterValue = masterAuditionValue;
     masterAuditionValue = null;
+    /* The autosave may already have written the mid-audition value. */
+    markSongsDirty();
     if (delta === 0) return;
     if (settings.masterMode === KNOB_MODE_RELATIVE) {
         const size = Math.min(63, Math.abs(delta));
         sendMasterValue(delta > 0 ? size : 64 + size);
     } else {
-        sendMasterValue(masterKnobValue);
+        sendMasterValue(settings.masterValue);
     }
 }
 
@@ -3835,13 +3844,14 @@ function handleMasterKnobTurn(data) {
      * and letting Shift go puts it back. It is not in auditionedKnobs
      * because it is not a knob object - it has no song, name or CC of
      * its own - so it keeps its own one-slot memory. */
-    if (shiftHeld && masterAuditionValue === null) masterAuditionValue = masterKnobValue;
+    if (shiftHeld && masterAuditionValue === null) masterAuditionValue = settings.masterValue;
     masterTurnUntil = Date.now() + KNOB_TURN_CLAIM_MS;
-    masterKnobValue = Math.max(0, Math.min(127, masterKnobValue + Math.sign(delta)));
+    settings.masterValue = Math.max(0, Math.min(127, settings.masterValue + Math.sign(delta)));
+    markSongsDirty();
     /* Same absolute/relative split as a song knob: Absolute sends the
      * position we track, Relative forwards Move's own encoder byte and
      * lets M8 accumulate. Channel and CC are its own, not the knobs'. */
-    const wireValue = settings.masterMode === KNOB_MODE_RELATIVE ? data[2] : masterKnobValue;
+    const wireValue = settings.masterMode === KNOB_MODE_RELATIVE ? data[2] : settings.masterValue;
     sendMasterValue(wireValue);
 }
 
@@ -4224,6 +4234,19 @@ globalThis.onMidiMessageInternal = function (data) {
         if (pressed) {
             if (moveControlNumber === moveSHIFT) {
                 shiftHeld = true;
+            }
+            /* THE ODD VIEW SCROLLS TWO ROWS AT A TIME.
+             *
+             * It shows M8 rows 0, 2, 4, 6 - every other one - so a
+             * one-row scroll swaps which rows are on screen and the
+             * whole grid changes under your hand. Two puts the NEXT
+             * four even rows up, which is what the view is for. Sent
+             * as a complete extra press before the real one, so the
+             * release that follows completes the second of two rather
+             * than leaving a key down. */
+            if (viewMode === VIEW_ODD
+                && (moveControlNumber === MoveUp || moveControlNumber === MoveDown)) {
+                pressOnM8(lppNote);
             }
             move_midi_external_send([2 << 4 | 0x9, 0x90, lppNote, 100]);
         } else {
