@@ -10,7 +10,7 @@ import * as std from "std";
 /* Shared utilities - absolute path for module location independence */
 import {
     MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete,
-    MoveMainButton, MoveMainTouch, MoveMainKnob,
+    MoveMainButton, MoveMainTouch, MoveMainKnob, MoveMasterTouch,
     MovePlay, MoveRec, MoveLoop, MoveMute, MoveUndo,
     MovePad32, MidiClock, MoveRGBLeds
 } from '/data/UserData/schwung/shared/constants.mjs';
@@ -163,6 +163,14 @@ const RGB_DIM_GREY = 123;      /* #404040 - visible in a lit room */
 const RGB_GREY = 118;          /* #595959 */
 const RGB_WHITE = 120;         /* #FFFFFF */
 
+/* The song-preset steps are the module's own row, not the M8's, and they
+ * sat in the same white-and-grey as the track buttons directly above
+ * them - two rows of the same two colours, telling you nothing about
+ * which was which. Amber is the one hue nothing else on this surface
+ * uses: the M8's own palette runs white, pink, green, blue and red. */
+const RGB_PRESET = 8;          /* #FFC516 bright yellow */
+const RGB_PRESET_DIM = 79;     /* #664E08 - its own dim variant */
+
 /* Kept for the LPP colour map below, which addresses pads only. */
 /* Only the LPP colour map uses these two now, and only as MOVE PALETTE
  * indices - the led call sites take a level through ledFor() instead.
@@ -201,6 +209,7 @@ const moveLOOP = MoveLoop;
 const moveMUTE = MoveMute;
 const moveUNDO = MoveUndo;
 const moveWHEELTouch = MoveMainTouch;
+const moveMASTERTouch = MoveMasterTouch;
 const moveJogTurn = MoveMainKnob;
 
 /* Which surface a control's led is, so a caller can name a colour once
@@ -594,6 +603,26 @@ function advanceViewMode() {
     queuePadRedraw();
     updateMoveViewPulse();
 }
+
+/* EACH SCREEN REMEMBERS ITS OWN HALF.
+ *
+ * The half used to be one value shared by every screen, which meant
+ * that looking at the bottom half of one screen and then switching
+ * halves on another silently moved the first one too - come back to it
+ * and you were on the top again, with nothing having touched it. So the
+ * half is filed under the screen you are leaving and fetched back for
+ * the screen you arrive at. A screen not visited yet opens on the top,
+ * which is where everything used to start. */
+const viewModeByMode = new Map();
+
+function switchLpMode(target) {
+    if (target === lpMode) return;
+    viewModeByMode.set(lpMode, viewMode);
+    const remembered = viewModeByMode.get(target);
+    lpMode = target;
+    viewMode = remembered === undefined ? VIEW_TOP : remembered;
+    queuePadRedraw();
+}
 let shiftHeld = false;
 let liveMode = false;
 let isPlaying = false;
@@ -777,8 +806,10 @@ const SONG_STEP_NOTES = [17, 19, 21, 23, 25, 27, 29, 31];
 function updateSongStepLeds(force) {
     SONG_STEP_NOTES.forEach((note, i) => {
         const song = songs[i];
-        if (!song) { setLED(note, ledFor(note, "off"), force); return; }
-        setLED(note, ledFor(note, song.id === activeSongId ? "bright" : "dim"), force);
+        if (!song) { setLED(note, RGB_OFF, force); return; }
+        /* Every step here is an RGB led, so these are palette indices
+         * rather than brightnesses - ledFor() is not needed. */
+        setLED(note, song.id === activeSongId ? RGB_PRESET : RGB_PRESET_DIM, force);
     });
 }
 
@@ -3482,6 +3513,26 @@ function drawSlotLabel(slot, text, inverted) {
     centeredText(songPageDrawCtx, cx, y, fitted, inverted ? 0 : 1);
 }
 
+/* The master knob's value, drawn OVER the page while it is moving.
+ *
+ * It cannot have a cell: the eight cells belong to the song knobs and
+ * the master is not one of them. A panel in the middle borrows the
+ * space instead and gives it straight back - the page underneath is
+ * redrawn whole on the next frame, so nothing has to be restored. A
+ * hollow box rather than a solid pill, so it reads as something laid on
+ * top of the dials instead of one of them. */
+const MASTER_OVERLAY_H = 17;
+
+function drawMasterOverlay() {
+    const label = "Main " + (masterKnobValue * 2).toString(16).toUpperCase().padStart(2, "0");
+    const w = Math.min(SCREEN_WIDTH - 8, text_width(label) + 18);
+    const x = Math.round((SCREEN_WIDTH - w) / 2);
+    const y = 24;
+    fill_rect(x, y, w, MASTER_OVERLAY_H, 1);
+    fill_rect(x + 1, y + 1, w - 2, MASTER_OVERLAY_H - 2, 0);
+    centeredText(songPageDrawCtx, SCREEN_WIDTH / 2, y + 5, label, 1);
+}
+
 /* Holding the jog wheel turns knob moves into an AUDITION: the values
  * you dial in while it is held are put back when you let go.
  *
@@ -3503,6 +3554,7 @@ function noteAuditionValue(knob) {
 }
 
 function revertAuditionedKnobs() {
+    revertMasterAudition();
     if (!auditionedKnobs.size) return;
     for (const [knob, original] of auditionedKnobs) {
         const delta = original - knob.value;
@@ -3549,6 +3601,17 @@ function claimKnobTouch(index) {
 function releaseKnobTouch(index) {
     if (activeKnobIndex !== index) return;
     activeKnobTouched = false;
+}
+
+/* The master knob has no cell on the page - the eight song knobs fill
+ * it - so its value is shown as a panel OVER them while it is being
+ * moved, on the same terms as a song knob's readout: for as long as it
+ * is touched, and for a moment after a turn. */
+let masterTouched = false;
+let masterTurnUntil = 0;
+
+function isMasterReadoutActive() {
+    return masterTouched || Date.now() < masterTurnUntil;
 }
 
 function claimKnobTurn(index) {
@@ -3678,6 +3741,9 @@ function drawSongPage() {
         drawSlotLabel(knobSelectIndex, sel ? sel.name : "Add", true);
     }
 
+    /* Last, so it covers whatever it lands on. */
+    if (isMasterReadoutActive()) drawMasterOverlay();
+
     return true;
 }
 
@@ -3722,18 +3788,46 @@ function handleSongKnobTurn(data) {
 }
 
 /* CC79 (master) pass-through - see the comment at its call site. Not part of
- * any song's data, no display representation, just forwards its own value. */
+ * any song's data, just forwards its own value; its only appearance on
+ * screen is the transient panel drawn by drawMasterOverlay. */
 let masterKnobValue = 0;
+/* Where the master knob stood when a Shift audition began, or null. */
+let masterAuditionValue = null;
+
+function sendMasterValue(wire) {
+    move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.masterChannel,
+                             settings.masterCc, wire]);
+}
+
+function revertMasterAudition() {
+    if (masterAuditionValue === null) return;
+    const delta = masterAuditionValue - masterKnobValue;
+    masterKnobValue = masterAuditionValue;
+    masterAuditionValue = null;
+    if (delta === 0) return;
+    if (settings.masterMode === KNOB_MODE_RELATIVE) {
+        const size = Math.min(63, Math.abs(delta));
+        sendMasterValue(delta > 0 ? size : 64 + size);
+    } else {
+        sendMasterValue(masterKnobValue);
+    }
+}
 
 function handleMasterKnobTurn(data) {
     const delta = decodeDelta(data[2]);
     if (delta === 0) return;
+    /* Shift auditions this knob too: the value moves and M8 hears it,
+     * and letting Shift go puts it back. It is not in auditionedKnobs
+     * because it is not a knob object - it has no song, name or CC of
+     * its own - so it keeps its own one-slot memory. */
+    if (shiftHeld && masterAuditionValue === null) masterAuditionValue = masterKnobValue;
+    masterTurnUntil = Date.now() + KNOB_TURN_CLAIM_MS;
     masterKnobValue = Math.max(0, Math.min(127, masterKnobValue + Math.sign(delta)));
     /* Same absolute/relative split as a song knob: Absolute sends the
      * position we track, Relative forwards Move's own encoder byte and
      * lets M8 accumulate. Channel and CC are its own, not the knobs'. */
     const wireValue = settings.masterMode === KNOB_MODE_RELATIVE ? data[2] : masterKnobValue;
-    move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.masterChannel, settings.masterCc, wireValue]);
+    sendMasterValue(wireValue);
 }
 
 /* External MIDI handler (from M8) */
@@ -3945,6 +4039,10 @@ globalThis.onMidiMessageInternal = function (data) {
                 } else {
                     releaseKnobTouch(moveNoteNumber);
                 }
+            } else if (moveNoteNumber === moveMASTERTouch) {
+                /* Note 8, the master knob. It has no cell to invert, so
+                 * touching it raises the overlay panel instead. */
+                masterTouched = data[2] === 127;
             }
             return;
         }
@@ -3993,7 +4091,10 @@ globalThis.onMidiMessageInternal = function (data) {
                  * press of the screen you are on, even though it shares
                  * the button with Session. */
                 if (target === lpMode) advanceViewMode();
-                lpMode = target;
+                else switchLpMode(target);
+                /* Odd rows belongs to the primary Session screen, so a
+                 * half remembered there is not necessarily legal here -
+                 * and the setting may have been turned off in between. */
                 reconcileOddRowsView();
                 traceScreen(moveControlNumber === moveBACK
                     ? (shiftHeld ? "Session 2 (Shift+Back)" : "Session (Back)")
