@@ -822,29 +822,48 @@ let padReassert = 0;
  * believing a Launchpad is attached - so on the way back in it has no
  * reason to send its grid again, and this time there is no cache to
  * replay either, the module having been reloaded. The pads stay dark
- * until something makes the M8 talk, which is why pressing a button or
- * changing page fixes it, and why power-cycling the M8 first avoids it
- * altogether.
+ * until something makes the M8 talk, which is why power-cycling it
+ * first avoids the problem.
  *
- * So if nothing at all has arrived a second after connecting, the
- * module presses Session on the M8's behalf. That is the cheapest
- * thing that makes it repaint, and it lands where the module already
- * assumes it is: lpMode starts at LP_SESSION, and the M8's own start
- * screen is Session.
+ * There is no message for this. MIDI has no "device disconnected" from
+ * the peripheral end - a host notices a Launchpad leaving because the
+ * USB device disappears, which is not something the module can do.
  *
- * Conditional on having heard NOTHING, so an M8 that did repaint on
- * its own is left alone and nobody's screen changes under them. */
+ * What the M8 does repaint for is a SCREEN CHANGE. And it has to be a
+ * change: pressing Session while already on Session is a no-op and
+ * repaints nothing, which is why asking for it once did not work. So
+ * the module steps to Note and straight back to Session, which lands
+ * where it started, having painted the whole grid on the way.
+ *
+ * Conditional on having heard NOTHING since connecting, so an M8 that
+ * is already talking is left alone and nobody's screen moves. */
 const M8_NUDGE_TICKS = 60;
+const M8_NUDGE_GAP_TICKS = 15;
 const LPP_SESSION_NOTE = 93;
+const LPP_NOTE_SCREEN_NOTE = 94;
+let m8NudgeStage = 0;
 let m8NudgeTicks = 0;
 let ledsSeenSinceConnect = 0;
 
+function pressOnM8(lppNote) {
+    move_midi_external_send([2 << 4 | 0x9, 0x90, lppNote, 100]);
+    move_midi_external_send([2 << 4 | 0x8, 0x80, lppNote, 0]);
+}
+
 function tickM8Nudge() {
-    if (m8NudgeTicks <= 0) return;
+    if (!m8NudgeStage) return;
     if (--m8NudgeTicks > 0) return;
-    if (ledsSeenSinceConnect > 0) return;
-    move_midi_external_send([2 << 4 | 0x9, 0x90, LPP_SESSION_NOTE, 100]);
-    move_midi_external_send([2 << 4 | 0x8, 0x80, LPP_SESSION_NOTE, 0]);
+    if (m8NudgeStage === 1) {
+        /* Still nothing after a second: the M8 thinks it is already
+         * talking to a Launchpad and will not start on its own. */
+        if (ledsSeenSinceConnect > 0) { m8NudgeStage = 0; return; }
+        pressOnM8(LPP_NOTE_SCREEN_NOTE);
+        m8NudgeStage = 2;
+        m8NudgeTicks = M8_NUDGE_GAP_TICKS;
+        return;
+    }
+    pressOnM8(LPP_SESSION_NOTE);
+    m8NudgeStage = 0;
 }
 
 function tickPadReassert() {
@@ -925,6 +944,7 @@ function markM8Connected() {
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
     padReassert = PAD_REASSERT_TICKS;
     ledsSeenSinceConnect = 0;
+    m8NudgeStage = 1;
     m8NudgeTicks = M8_NUDGE_TICKS;
 }
 
