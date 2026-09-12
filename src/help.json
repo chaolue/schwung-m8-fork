@@ -115,9 +115,6 @@
             " screen only. See",
             " Pads.",
             "",
-            "Line In: how to",
-            " monitor the input.",
-            "",
             "All of these are",
             "global, not per",
             "song."
@@ -531,39 +528,6 @@
             "for what they do",
             "while that screen",
             "is open."
-          ]
-        },
-        {
-          "title": "Line In",
-          "lines": [
-            "To hear the M8",
-            "through Move, load",
-            "Schwung's own Line",
-            "In module into a",
-            "chain slot before",
-            "entering this",
-            "module.",
-            "",
-            "It has input",
-            "conditioning, a",
-            "noise gate, HPF and",
-            "a safety limiter,",
-            "and Schwung's",
-            "feedback protection",
-            "watches it.",
-            "",
-            "WARNING: monitoring",
-            "the input through",
-            "the speaker can",
-            "feed back. Use",
-            "headphones, or keep",
-            "the level low.",
-            "",
-            "This module cannot",
-            "do it itself: audio",
-            "is not reachable",
-            "from a JS module in",
-            "Schwung."
           ]
         }
       ]

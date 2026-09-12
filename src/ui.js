@@ -12,7 +12,7 @@ import {
     MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete,
     MoveMainButton, MoveMainTouch, MoveMainKnob,
     MovePlay, MoveRec, MoveLoop, MoveMute, MoveUndo,
-    MovePad32, MidiClock
+    MovePad32, MidiClock, MoveRGBLeds
 } from '/data/UserData/schwung/shared/constants.mjs';
 import { setLED, setButtonLED, decodeDelta } from '/data/UserData/schwung/shared/input_filter.mjs';
 import { buildMetaIndex } from '/data/UserData/schwung/shared/param_pages/param_meta.mjs';
@@ -126,7 +126,36 @@ const lppPadToMovePadMapOdd = new Map([
 
 const moveToLppPadMapOdd = new Map([...lppPadToMovePadMapOdd.entries()].map((a) => [a[1], a[0]]));
 
-/* M8-specific colors for LPP color translation */
+/* ------------------------------------------------------------- LED values
+ *
+ * MOVE HAS TWO KINDS OF LED AND THEY SPEAK DIFFERENT LANGUAGES.
+ *
+ * An RGB led (every pad, all 16 steps, Play, Rec, Sample and the four row
+ * buttons) reads its value as an INDEX INTO THE PALETTE in constants.mjs.
+ * A white led (Back, Menu, Capture, Loop, Mute, Delete, Copy, Undo, Shift
+ * and the arrows) reads the same byte as a BRIGHTNESS, 0-127.
+ *
+ * The two greys below were brightnesses - 0x10 dim, 0x7c bright - and they
+ * are correct for a white led. Sent to an RGB one they were read as
+ * palette entries, and the palette says something else entirely:
+ *
+ *     0x10 = 16  -> #31ADFF Azure Blue      (wanted: a dark grey)
+ *     0x7c = 124 -> #141414 Dark Grey 2     (wanted: a bright grey)
+ *
+ * So the song-preset steps lit BLUE where they should have been dim, and
+ * Play lit almost black where it should have been bright. Naming them for
+ * the surface they belong to is what stops that recurring; ledFor() below
+ * makes it structural. */
+const WHITE_DIM = 0x10;
+const WHITE_BRIGHT = 0x7c;
+
+/* Palette indices, from the table at the top of constants.mjs. */
+const RGB_OFF = 0;
+const RGB_DIM_GREY = 123;      /* #404040 - visible in a lit room */
+const RGB_GREY = 118;          /* #595959 */
+const RGB_WHITE = 120;         /* #FFFFFF */
+
+/* Kept for the LPP colour map below, which addresses pads only. */
 const light_grey = 0x7c;
 const dim_grey = 0x10;
 const green = 0x7e;
@@ -157,6 +186,22 @@ const moveMUTE = MoveMute;
 const moveUNDO = MoveUndo;
 const moveWHEELTouch = MoveMainTouch;
 const moveJogTurn = MoveMainKnob;
+
+/* Which surface a control's led is, so a caller can name a colour once
+ * and have it come out right on either. MoveRGBLeds is the list in
+ * constants.mjs, so this cannot drift from the hardware. */
+const RGB_LED_SET = new Set(MoveRGBLeds);
+
+/* Semantic names, resolved per led. Every call site says what it MEANS
+ * - off, dim, bright - instead of a number that is only correct on one
+ * of the two surfaces. */
+function ledFor(control, level) {
+    const rgb = RGB_LED_SET.has(control);
+    if (level === "off") return rgb ? RGB_OFF : 0x00;
+    if (level === "dim") return rgb ? RGB_DIM_GREY : WHITE_DIM;
+    if (level === "bright") return rgb ? RGB_WHITE : WHITE_BRIGHT;
+    return rgb ? RGB_GREY : WHITE_DIM;
+}
 
 /* Color mapping */
 const lppColorToMoveColorMap = new Map([
@@ -494,10 +539,10 @@ function routeTextEntryInput(data) {
 }
 
 function updateMoveViewPulse() {
-    setButtonLED(moveBACK, dim_grey);
-    setButtonLED(moveMENU, dim_grey);
-    setButtonLED(moveCAP, dim_grey);
-    setButtonLED(currentView, light_grey);
+    setButtonLED(moveBACK, ledFor(moveBACK, "dim"));
+    setButtonLED(moveMENU, ledFor(moveMENU, "dim"));
+    setButtonLED(moveCAP, ledFor(moveCAP, "dim"));
+    setButtonLED(currentView, ledFor(currentView, "bright"));
     /* Which view you are in, as an animation on the view button: Top is
      * steady, Bottom pulses, Odd blinks faster. The channel nibble of the
      * status byte picks the animation (see constants.mjs - 0xA is
@@ -527,8 +572,8 @@ const SONG_STEP_NOTES = [17, 19, 21, 23, 25, 27, 29, 31];
 function updateSongStepLeds(force) {
     SONG_STEP_NOTES.forEach((note, i) => {
         const song = songs[i];
-        if (!song) { setLED(note, black, force); return; }
-        setLED(note, song.id === activeSongId ? white : dim_grey, force);
+        if (!song) { setLED(note, ledFor(note, "off"), force); return; }
+        setLED(note, ledFor(note, song.id === activeSongId ? "bright" : "dim"), force);
     });
 }
 
@@ -565,7 +610,7 @@ function selectSongByStep(index) {
 }
 
 function updatePLAYLed() {
-    if (!liveMode && !isPlaying) setButtonLED(movePLAY, light_grey);
+    if (!liveMode && !isPlaying) setButtonLED(movePLAY, ledFor(movePLAY, "bright"));
     if (!liveMode && isPlaying) setButtonLED(movePLAY, green);
     if (liveMode && !isPlaying) setButtonLED(movePLAY, sky);
     if (liveMode && isPlaying) setButtonLED(movePLAY, navy);
@@ -1797,7 +1842,7 @@ function getActivePage() {
 
 const SETTINGS_ROWS = [
     "songs", "knobChannel", "masterCc", "masterChannel", "masterMode",
-    "oddRows", "lineIn",
+    "oddRows",
 ];
 const SETTINGS_LABELS = {
     songs: "Songs",
@@ -1806,27 +1851,21 @@ const SETTINGS_LABELS = {
     masterChannel: "Mstr Chan",
     masterMode: "Mstr Mode",
     oddRows: "Odd Rows",
-    lineIn: "Line In",
 };
 const ONOFF_OPTIONS = ["Off", "On"];
 
 let settingsOpen = false;
 let settingsCursor = 0;
 let settingsEntered = false;
-/* The Line In row opens a page of text rather than editing anything -
- * see drawLineInHelp for why it is advice and not a switch. */
-let lineInHelpOpen = false;
 
 function openSettings() {
     settingsOpen = true;
     settingsCursor = 0;
     settingsEntered = false;
-    lineInHelpOpen = false;
 }
 
 function closeSettings() {
     settingsOpen = false;
-    lineInHelpOpen = false;
     queuePadRedraw();
     updateMoveViewPulse();
     updateSongStepLeds();
@@ -1887,7 +1926,7 @@ function handleSettingsInput(data) {
         if (delta === 0) return;
         if (settingsEntered) {
             adjustSetting(SETTINGS_ROWS[settingsCursor], Math.sign(delta));
-        } else if (!lineInHelpOpen) {
+        } else {
             settingsCursor = Math.max(0, Math.min(SETTINGS_ROWS.length - 1,
                                                   settingsCursor + Math.sign(delta)));
         }
@@ -1897,7 +1936,6 @@ function handleSettingsInput(data) {
     if (!pressed) return;
 
     if (moveControlNumber === moveBACK) {
-        if (lineInHelpOpen) { lineInHelpOpen = false; return; }
         if (settingsEntered) { settingsEntered = false; return; }
         closeSettings();
         return;
@@ -1906,18 +1944,15 @@ function handleSettingsInput(data) {
     if (moveControlNumber !== moveWHEEL) return;
 
     const row = SETTINGS_ROWS[settingsCursor];
-    if (lineInHelpOpen) { lineInHelpOpen = false; return; }
     if (row === "songs") {
         settingsOpen = false;
         openSongManagement();
         return;
     }
-    if (row === "lineIn") { lineInHelpOpen = true; return; }
     settingsEntered = !settingsEntered;
 }
 
 function drawSettings() {
-    if (lineInHelpOpen) { drawLineInHelp(); return; }
     clear_screen();
     drawMenuHeader("Settings");
     drawMenuList({
@@ -1928,37 +1963,6 @@ function drawSettings() {
         getValue: (row) => settingsRowValue(row),
     });
     drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Close"]);
-}
-
-/* Line In is ADVICE, not a switch.
- *
- * Passing the input to the output needs the audio buffers, and Schwung
- * exposes none of that to JS - audio lives in the shim and in native DSPs
- * now. The pre-Schwung version of this module did it by writing samples
- * straight into the SPI mmap, which under Schwung would be writing into a
- * buffer the shim is already compositing shadow audio, Master FX and
- * master volume into.
- *
- * Schwung also already ships the feature, done properly: the Line In
- * module is a chainable sound generator with input conditioning, a noise
- * gate, HPF and a safety limiter, and Schwung's feedback protection
- * watches it specifically - bypassing it at boot and when headphones are
- * unplugged. So this row points at that rather than building a second,
- * unguarded one. */
-function drawLineInHelp() {
-    clear_screen();
-    drawMenuHeader("Line In");
-    /* Five rows is what fits between the header and the footer at a 9px
-     * pitch; more silently ran off the bottom of the 64px screen. */
-    const lines = [
-        "Load Schwung's own",
-        "Line In module in a",
-        "chain slot.",
-        "",
-        "WARNING: can feed back",
-    ];
-    lines.forEach((text, i) => print(4, 12 + i * 9, text, 1));
-    drawMenuFooter(["Back: Close"]);
 }
 
 /* ============================================================================
