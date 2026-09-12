@@ -2507,6 +2507,73 @@ function drawSongMgmt() {
 }
 
 /* ============================================================================
+ * Knob Select - a cursor over the eight slots of the current page.
+ *
+ * Reached with a plain jogwheel click, which had nothing to do once
+ * switching grid halves moved to the mode buttons. The wheel walks the
+ * cursor, a second click opens whatever the slot holds, and Back
+ * leaves. It replaces Shift+touch as the way into Knob Settings, which
+ * is what freed Shift to be the audition.
+ *
+ * An EMPTY slot is a valid stop rather than something to skip: clicking
+ * one opens the Add Knob wizard, exactly as Shift+touch on an empty
+ * slot used to. Skipping them would make an empty page unreachable.
+ * ============================================================================ */
+
+let knobSelectOpen = false;
+let knobSelectIndex = 0;
+
+function openKnobSelect() {
+    knobSelectOpen = true;
+    /* Start on the first slot that HAS something, so the common case -
+     * one knob on the page - needs no scrolling at all. Falls back to
+     * slot 0 on an empty page, which is then the Add Knob door. */
+    const page = getActivePage();
+    const first = page ? page.knobs.findIndex((k) => k) : -1;
+    knobSelectIndex = first >= 0 ? first : 0;
+}
+
+function closeKnobSelect() {
+    knobSelectOpen = false;
+}
+
+/* Returns true when the cursor has taken the message. Unlike the menu
+ * screens this is only an OVERLAY on the song page - the pads, the mode
+ * buttons and the knobs all still mean what they usually do - so it
+ * claims just the three controls it drives (wheel turn, wheel click,
+ * Back) and lets everything else through to the normal handler. */
+function handleKnobSelectInput(data) {
+    if (data[0] !== 0xb0) return false;
+    const control = data[1];
+    const pressed = data[2] === 127;
+
+    if (control === moveJogTurn) {
+        const delta = decodeDelta(data[2]);
+        if (delta === 0) return true;
+        knobSelectIndex = Math.max(0, Math.min(KNOBS_PER_PAGE - 1,
+                                               knobSelectIndex + Math.sign(delta)));
+        return true;
+    }
+
+    if (control !== moveBACK && control !== moveWHEEL) return false;
+    if (!pressed) return true;          /* the release of one we took */
+
+    if (control === moveBACK) {
+        closeKnobSelect();
+        return true;
+    }
+
+    const page = getActivePage();
+    const slot = knobSelectIndex;
+    closeKnobSelect();
+    if (page) {
+        if (page.knobs[slot]) openKnobEdit(slot);
+        else openKnobWizard({ pageIndex: activePageIndex, slot });
+    }
+    return true;
+}
+
+/* ============================================================================
  * Knob Settings screen - Shift+touch a knob (notes 0-7) to open it, Back to
  * close. Drawn with the same drawMenuHeader/drawMenuList/drawMenuFooter chrome
  * as Song Management below, rather than the param-page dial/bar widgets, so
@@ -3384,8 +3451,13 @@ function drawSlotLabel(slot, text, inverted) {
     fill_rect(Math.round(cx - CELL_W / 2), y - 1, CELL_W, LABEL_ROW_H, 0);
     const fitted = fitText(songPageDrawCtx, text, CELL_W - 2);
     if (inverted) {
-        const w = text_width(fitted) + 4;
-        fill_rect(Math.round(cx - w / 2), y - 1, w, LABEL_ROW_H, 1);
+        /* The pill hugs the text, so it can be WIDER than the cell -
+         * the text is fitted to CELL_W - 2 and the pill adds four for
+         * its padding. In the last cell that ran off the right edge
+         * and fill_rect refused the write. Clamped to the panel. */
+        const w = Math.min(text_width(fitted) + 4, SCREEN_WIDTH);
+        const x = Math.max(0, Math.min(Math.round(cx - w / 2), SCREEN_WIDTH - w));
+        fill_rect(x, y - 1, w, LABEL_ROW_H, 1);
     }
     centeredText(songPageDrawCtx, cx, y, fitted, inverted ? 0 : 1);
 }
@@ -3401,11 +3473,13 @@ function drawSlotLabel(slot, text, inverted) {
  * so holding the wheel without touching anything costs nothing. Reverting
  * has to reach M8 as well as the display, and how depends on the knob's
  * send mode - see revertAuditionedKnobs. */
-let jogWheelHeld = false;
 const auditionedKnobs = new Map();   /* knob object -> value before the audition */
 
+/* Held SHIFT is what makes a knob move an audition now. It used to be a
+ * held wheel touch, and the wheel was needed back for knob select;
+ * Shift came free the moment knob editing moved off Shift+touch. */
 function noteAuditionValue(knob) {
-    if (jogWheelHeld && !auditionedKnobs.has(knob)) auditionedKnobs.set(knob, knob.value);
+    if (shiftHeld && !auditionedKnobs.has(knob)) auditionedKnobs.set(knob, knob.value);
 }
 
 function revertAuditionedKnobs() {
@@ -3575,6 +3649,15 @@ function drawSongPage() {
                       formatKnobReadoutValue(page.knobs[activeKnobIndex]), true);
     }
 
+    /* The knob-select cursor, in the same inverted pill the value
+     * readout uses - one visual idea for "this slot, right now" rather
+     * than a second one to learn. An empty slot has no name to invert,
+     * so it gets the thing clicking it would do. */
+    if (knobSelectOpen) {
+        const sel = page.knobs[knobSelectIndex];
+        drawSlotLabel(knobSelectIndex, sel ? sel.name : "Add", true);
+    }
+
     return true;
 }
 
@@ -3588,7 +3671,7 @@ function drawSongPage() {
  * DEFAULT_SETTINGS. M8's CONTROL MAP CHANNEL (MIDI Settings view) has to
  * match settings.knobChannel or nothing the knobs send is heard. */
 
-function handleSongKnobTurn(data, shiftHeld) {
+function handleSongKnobTurn(data) {
     const knobIndex = data[1] - 71;
     if (knobIndex < 0 || knobIndex >= KNOBS_PER_PAGE) return;
 
@@ -3598,12 +3681,10 @@ function handleSongKnobTurn(data, shiftHeld) {
     const delta = decodeDelta(data[2]);
     if (delta === 0) return;
 
-    if (shiftHeld) {
-        /* Renaming/reassigning this knob's CC is Shift+TOUCH (Knob Edit),
-         * not Shift+turn - a shift-held turn here just does nothing rather
-         * than also nudging the value while the user is reaching for touch. */
-        return;
-    }
+    /* Shift+turn is the AUDITION: the value moves and M8 hears it, and
+     * letting Shift go puts it back (noteAuditionValue below records the
+     * starting point). The gesture used to be the jogwheel touch, which
+     * the knob cursor now owns. */
 
     const knob = page.knobs[knobIndex];
     if (!knob) return; /* empty slot - this encoder controls nothing here */
@@ -3794,6 +3875,7 @@ globalThis.onMidiMessageInternal = function (data) {
         handleSettingsInput(data);
         return;
     }
+    if (knobSelectOpen && handleKnobSelectInput(data)) return;
     if (knobEditOpen) {
         handleKnobEditInput(data);
         return;
@@ -3816,16 +3898,9 @@ globalThis.onMidiMessageInternal = function (data) {
 
         /* Wheel touch holds the AUDITION and nothing else now - which
          * half of the grid is showing moved to the mode buttons. */
-        if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
-            jogWheelHeld = true;
-            return;
-        }
-
-        if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
-            jogWheelHeld = false;
-            revertAuditionedKnobs();
-            return;
-        }
+        /* The wheel holds nothing now: the audition is Shift and the
+         * grid halves are the mode buttons. */
+        if (moveNoteNumber === moveWHEELTouch) return;
 
         let lppNote = activeMoveToLppPadMap.get(moveNoteNumber);
 
@@ -3839,23 +3914,13 @@ globalThis.onMidiMessageInternal = function (data) {
                 return;
             }
 
-            /* Shift+touch a song knob (notes 0-7; note 8 is the master knob,
-             * which has no name/CC of its own to edit) opens Knob Edit. A
-             * plain touch instead claims it for the title-row value readout
-             * (see isKnobReadoutActive) until release. */
+            /* Touching a song knob (notes 0-7; note 8 is the master
+             * knob, which has no name or CC of its own) claims it for
+             * the value readout until release. Shift+touch used to open
+             * Knob Settings; that is the jogwheel's job now, which is
+             * what freed Shift for the audition. */
             if (moveNoteNumber >= 0 && moveNoteNumber <= 7) {
-                if (shiftHeld && data[2] === 127) {
-                    /* Shift+touch a FILLED slot edits that knob; an EMPTY
-                     * one has nothing to edit, so it offers to fill itself
-                     * instead - the faint tick render_page.mjs already draws
-                     * for an unused slot is the affordance. */
-                    const page = getActivePage();
-                    if (page && page.knobs[moveNoteNumber]) {
-                        openKnobEdit(moveNoteNumber);
-                    } else if (page) {
-                        openKnobWizard({ pageIndex: activePageIndex, slot: moveNoteNumber });
-                    }
-                } else if (data[2] === 127) {
+                if (data[2] === 127) {
                     claimKnobTouch(moveNoteNumber);
                 } else {
                     releaseKnobTouch(moveNoteNumber);
@@ -3938,7 +4003,7 @@ globalThis.onMidiMessageInternal = function (data) {
                 openSettings();
                 return;
             }
-            /* Unclaimed: switching halves moved to the mode buttons. */
+            openKnobSelect();
             return;
         }
 
@@ -3976,7 +4041,7 @@ globalThis.onMidiMessageInternal = function (data) {
              * doing something useful without inventing a dedicated feature
              * for it. */
             if (moveControlNumber >= 71 && moveControlNumber <= 78) {
-                handleSongKnobTurn(data, shiftHeld);
+                handleSongKnobTurn(data);
             } else if (moveControlNumber === 79) {
                 handleMasterKnobTurn(data);
             }
@@ -3993,6 +4058,8 @@ globalThis.onMidiMessageInternal = function (data) {
         } else {
             if (moveControlNumber === moveSHIFT) {
                 shiftHeld = false;
+                /* Letting go is what puts an auditioned knob back. */
+                revertAuditionedKnobs();
             }
             move_midi_external_send([2 << 4 | 0x8, 0x80, lppNote, 0]);
         }
