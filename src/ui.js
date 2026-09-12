@@ -575,10 +575,24 @@ function traceReport() {
     traceFlush();
 }
 
+/* Lines written outside a window used to be lost. traceReport blanks
+ * the label when it finishes and then early-returns forever after, so
+ * tracePending simply grew and was never written - every nudge
+ * attempt past the first, and every outcome, reached no file at all.
+ * That reads as the code not running. Flush on a timer as well. */
+const TRACE_FLUSH_EVERY = 88;          /* about two seconds */
+let traceFlushCount = 0;
+
 function traceTick() {
-    if (!traceOn || traceFramesLeft <= 0) return;
-    traceFramesLeft--;
-    if (traceFramesLeft === 0) traceReport();
+    if (!traceOn) return;
+    if (traceFramesLeft > 0) {
+        traceFramesLeft--;
+        if (traceFramesLeft === 0) traceReport();
+    }
+    if (++traceFlushCount >= TRACE_FLUSH_EVERY) {
+        traceFlushCount = 0;
+        traceFlush();
+    }
 }
 
 function viewStops() {
@@ -904,6 +918,7 @@ function tickM8Nudge() {
     }
 
     if (m8NudgeStage === 2) {
+        traceWrite(`  nudge ${m8NudgeAttempts}: pressing Session (heard ${ledsSeenSinceConnect})`);
         pressOnM8(LPP_SESSION_NOTE);
         m8NudgeStage = 3;
         m8NudgeTicks = M8_NUDGE_SETTLE_TICKS;
