@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M8 Songs</title>
+<style>
+:root{
+  --bg:#0c0c0e; --card:#17171a; --card-hi:#212126;
+  --text:#e6e4eb; --muted:#9d9ba3;
+  --accent:#e8a84c; --accent-dim:#b87a30;
+  --blue:#5b8def; --border:#28272e;
+  --danger:#d32f2f; --ok:#5ab8a6;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;padding:20px;background:var(--bg);color:var(--text);
+  font:15px/1.55 "Plus Jakarta Sans",-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+}
+h1{font-size:1.35rem;margin:0 0 4px;letter-spacing:-.01em}
+.sub{color:var(--muted);font-size:13.5px;margin:0 0 18px;max-width:70ch}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px}
+button{
+  font:inherit;font-size:13.5px;padding:6px 12px;border-radius:6px;
+  border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;
+}
+button:hover:not(:disabled){background:var(--card-hi)}
+button:disabled{opacity:.4;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:#1a1205;font-weight:600}
+button.primary:hover:not(:disabled){background:var(--accent-dim)}
+button.danger{color:#ff9a92;border-color:#4a2422}
+button.danger:hover:not(:disabled){background:#2a1614}
+button.icon{padding:4px 9px;font-family:var(--mono);line-height:1.2}
+.status{margin-left:auto;font-size:13px;color:var(--muted);font-family:var(--mono)}
+.status.ok{color:var(--ok)}
+.status.err{color:#ff9a92}
+.status.dirty{color:var(--accent)}
+
+ol.songs{list-style:none;margin:0 0 18px;padding:0;display:flex;flex-direction:column;gap:8px}
+li.song{
+  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;display:grid;gap:10px;
+  grid-template-columns:auto 1fr auto;align-items:center;
+}
+li.song.active{border-color:var(--accent-dim)}
+.slot{
+  font-family:var(--mono);font-size:11px;width:34px;height:34px;border-radius:6px;
+  display:grid;place-items:center;border:1px solid var(--border);
+  background:#111;color:var(--muted);
+}
+.slot.lit{background:rgba(232,168,76,.14);border-color:var(--accent-dim);color:var(--accent)}
+.slot.off{opacity:.45}
+.name{display:flex;flex-direction:column;gap:3px;min-width:0}
+.name input{
+  font:inherit;font-size:14.5px;padding:5px 8px;border-radius:5px;
+  border:1px solid var(--border);background:#101013;color:var(--text);width:100%;max-width:26rem;
+}
+.name input:focus{outline:2px solid var(--blue);outline-offset:1px}
+.meta{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+.meta .knobs{color:#7e7c86}
+.acts{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
+.badge{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;
+  padding:2px 7px;border-radius:4px;background:rgba(232,168,76,.14);
+  color:var(--accent);border:1px solid var(--accent-dim);
+}
+.note{
+  border-left:3px solid var(--border);padding:8px 12px;margin:0 0 16px;
+  color:var(--muted);font-size:13px;max-width:80ch;
+}
+.empty{color:var(--muted);font-style:italic;padding:14px 0}
+@media (max-width:560px){
+  li.song{grid-template-columns:auto 1fr}
+  .acts{grid-column:1 / -1;justify-content:flex-start}
+}
+</style>
+</head>
+<body>
+
+<h1>M8 Songs</h1>
+<p class="sub">The song bank for the M8 LPP Emulator. Position in this list is the
+step button that recalls a song — the first eight are on the eight preset steps.
+Changes are written to the device and picked up by a running module within a couple
+of seconds.</p>
+
+<div class="bar">
+  <button id="add">+ Add song</button>
+  <button id="reload">Reload from device</button>
+  <button id="save" class="primary" disabled>Save changes</button>
+  <span id="status" class="status">Loading…</span>
+</div>
+
+<p class="note">Knobs are edited on the Move itself — this page moves, renames,
+adds and removes whole songs, and chooses which one is active. Each song's knobs
+travel with it.</p>
+
+<ol class="songs" id="list"></ol>
+
+<script>
+"use strict";
+
+/* Served from the module's own directory, so songs.json is a sibling and
+ * reads need no path juggling. Writes go through the manager's file API,
+ * which is the only endpoint that can put a file back on the device. */
+var MODULE_DIR = "/data/UserData/schwung/modules/overtake/m8";
+var READ_URL = "songs.json";
+var UPLOAD_URL = "/files/upload";
+
+var doc = null;          /* the whole songs.json, as loaded */
+var dirty = false;
+
+function csrfToken() {
+    var m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+    return m ? decodeURIComponent(m[1]) : "";
+}
+
+function setStatus(text, kind) {
+    var el = document.getElementById("status");
+    el.textContent = text;
+    el.className = "status" + (kind ? " " + kind : "");
+}
+
+function markDirty() {
+    dirty = true;
+    document.getElementById("save").disabled = false;
+    setStatus("Unsaved changes", "dirty");
+}
+
+function knobSummary(song) {
+    var pages = (song.pages || []).length;
+    var filled = 0;
+    (song.pages || []).forEach(function (p) {
+        (p.knobs || []).forEach(function (k) { if (k) filled++; });
+    });
+    return pages + (pages === 1 ? " page" : " pages") + ", " +
+           filled + (filled === 1 ? " knob" : " knobs");
+}
+
+function render() {
+    var list = document.getElementById("list");
+    list.textContent = "";
+    if (!doc || !doc.songs || !doc.songs.length) {
+        var p = document.createElement("li");
+        p.className = "empty";
+        p.textContent = "No songs on the device yet.";
+        list.appendChild(p);
+        return;
+    }
+
+    doc.songs.forEach(function (song, i) {
+        var li = document.createElement("li");
+        li.className = "song" + (song.id === doc.activeSongId ? " active" : "");
+
+        var slot = document.createElement("div");
+        slot.className = "slot " + (i < 8 ? "lit" : "off");
+        slot.textContent = i < 8 ? "STEP " + (i + 1) : "—";
+        slot.title = i < 8
+            ? "Recalled by preset step " + (i + 1)
+            : "Past the eight preset steps — reachable from Settings > Songs on the device";
+        li.appendChild(slot);
+
+        var name = document.createElement("div");
+        name.className = "name";
+        var input = document.createElement("input");
+        input.type = "text";
+        input.value = song.name || "";
+        input.maxLength = 32;
+        input.setAttribute("aria-label", "Song name");
+        input.addEventListener("input", function () {
+            song.name = input.value;
+            markDirty();
+        });
+        name.appendChild(input);
+
+        var meta = document.createElement("div");
+        meta.className = "meta";
+        meta.innerHTML = "";
+        var knobs = document.createElement("span");
+        knobs.className = "knobs";
+        knobs.textContent = knobSummary(song);
+        meta.appendChild(knobs);
+        if (song.id === doc.activeSongId) {
+            var b = document.createElement("span");
+            b.className = "badge";
+            b.textContent = "Active";
+            b.style.marginLeft = "8px";
+            meta.appendChild(b);
+        }
+        name.appendChild(meta);
+        li.appendChild(name);
+
+        var acts = document.createElement("div");
+        acts.className = "acts";
+
+        acts.appendChild(button("↑", "Move up a step", i === 0, function () {
+            swap(i, i - 1);
+        }));
+        acts.appendChild(button("↓", "Move down a step", i === doc.songs.length - 1, function () {
+            swap(i, i + 1);
+        }));
+        acts.appendChild(button("Make active", "Switch the module to this song",
+                                song.id === doc.activeSongId, function () {
+            doc.activeSongId = song.id;
+            markDirty();
+            render();
+        }));
+        var del = button("Delete", "Remove this song and its knobs",
+                         doc.songs.length < 2, function () {
+            if (!window.confirm("Delete “" + (song.name || "this song") +
+                                "” and its knobs?")) return;
+            doc.songs.splice(i, 1);
+            if (doc.activeSongId === song.id) doc.activeSongId = doc.songs[0].id;
+            markDirty();
+            render();
+        });
+        del.className = "icon danger";
+        acts.appendChild(del);
+
+        li.appendChild(acts);
+        list.appendChild(li);
+    });
+}
+
+function button(label, title, disabled, onClick) {
+    var b = document.createElement("button");
+    b.className = "icon";
+    b.textContent = label;
+    b.title = title;
+    b.disabled = !!disabled;
+    b.addEventListener("click", onClick);
+    return b;
+}
+
+function swap(a, b) {
+    var tmp = doc.songs[a];
+    doc.songs[a] = doc.songs[b];
+    doc.songs[b] = tmp;
+    markDirty();
+    render();
+}
+
+/* A new song matches what the module itself creates: one page of eight
+ * empty slots. The module fills in anything else it needs on load. */
+function newSongId() {
+    return "web" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+}
+
+document.getElementById("add").addEventListener("click", function () {
+    if (!doc) return;
+    doc.songs.push({
+        id: newSongId(),
+        name: "New Song",
+        pages: [{ knobs: [null, null, null, null, null, null, null, null] }]
+    });
+    markDirty();
+    render();
+});
+
+document.getElementById("reload").addEventListener("click", function () {
+    if (dirty && !window.confirm("Discard your unsaved changes and reload from the device?")) return;
+    load();
+});
+
+document.getElementById("save").addEventListener("click", save);
+
+function load() {
+    setStatus("Loading…");
+    /* Cache-busted: the file changes under the browser every time the
+     * module autosaves. */
+    fetch(READ_URL + "?t=" + Date.now(), { cache: "no-store" })
+        .then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        })
+        .then(function (json) {
+            doc = json;
+            if (!Array.isArray(doc.songs)) doc.songs = [];
+            dirty = false;
+            document.getElementById("save").disabled = true;
+            render();
+            setStatus(doc.songs.length + (doc.songs.length === 1 ? " song" : " songs"), "ok");
+        })
+        .catch(function (e) {
+            setStatus("Could not read songs.json — " + e.message, "err");
+        });
+}
+
+function save() {
+    if (!doc) return;
+    setStatus("Saving…");
+    /* The whole file goes back, settings and all: the module merges
+     * nothing here, it simply re-reads what it finds. */
+    var body = new Blob([JSON.stringify(doc)], { type: "application/json" });
+    var form = new FormData();
+    form.append("path", MODULE_DIR);
+    form.append("file", new File([body], "songs.json", { type: "application/json" }));
+    fetch(UPLOAD_URL, {
+        method: "POST",
+        headers: { "X-CSRF-Token": csrfToken() },
+        body: form
+    }).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        dirty = false;
+        document.getElementById("save").disabled = true;
+        setStatus("Saved — the module picks it up within a couple of seconds", "ok");
+    }).catch(function (e) {
+        setStatus("Save failed — " + e.message, "err");
+    });
+}
+
+load();
+</script>
+</body>
+</html>

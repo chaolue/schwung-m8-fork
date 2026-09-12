@@ -2191,8 +2191,13 @@ function removeKnobAt(song, pageIndex, slot) {
     markSongsDirty();
 }
 
+/* The text of songs.json as this module last saw it, so an edit made
+ * from the web page can be told apart from our own autosave. */
+let lastSongsRaw = null;
+
 function loadSongs() {
     const raw = std.loadFile(SONGS_PATH);
+    lastSongsRaw = raw;
     if (raw) {
         try {
             const parsed = std.parseExtJSON(raw);
@@ -2344,12 +2349,40 @@ function writeModuleConfig() {
     lastConfigRaw = merged;
 }
 
+/* SONGS CAN BE EDITED FROM THE WEB PAGE TOO.
+ *
+ * web_ui.html rewrites songs.json whole - reordering, renaming, adding
+ * and deleting songs - so the file is watched on the same beat as
+ * config.json and reloaded when it changes underneath us.
+ *
+ * Two things are never interrupted: a screen that owns the surface (you
+ * are editing on the device, and pulling the list out from under a
+ * cursor would be worse than being briefly out of date), and unsaved
+ * local edits, which are flushed first and therefore win. Neither can
+ * strand the reload - the poll comes round again. */
+function tickSongsFile() {
+    if (screenOwnsSurface() || songsDirty) return;
+    let raw = null;
+    try { raw = std.loadFile(SONGS_PATH); } catch (e) { return; }
+    if (raw === null || raw === lastSongsRaw) return;
+    loadSongs();
+    /* loadSongs re-reads the settings block too, so the web UI's
+     * config.json has to win again afterwards. */
+    loadModuleConfig();
+    reconcileOddRowsView();
+    updateSongStepLeds(true);
+    queuePadRedraw();
+    updateMoveViewPulse();
+    console.log(`tickSongsFile: reloaded, ${songs.length} song(s)`);
+}
+
 /* A browser can change the file at any moment, so it is watched rather
  * than read once. Cheap: an unchanged file costs one read every couple
  * of seconds and no parse. */
 function tickModuleConfig() {
     if (++configPollTicks < CONFIG_POLL_TICKS) return;
     configPollTicks = 0;
+    tickSongsFile();
     const raw = readConfigRaw();
     if (raw === lastConfigRaw) return;
     lastConfigRaw = raw;
@@ -2371,8 +2404,11 @@ function saveSongs() {
         console.log(`saveSongs: failed to open ${SONGS_PATH} for writing`);
         return;
     }
-    f.puts(JSON.stringify({ activeSongId, settings, songs }));
+    const body = JSON.stringify({ activeSongId, settings, songs });
+    f.puts(body);
     f.close();
+    /* So the watcher below can tell our own write from someone else's. */
+    lastSongsRaw = body;
     /* Mirror the settings out to the web UI's file. Done here rather
      * than at each edit site so no future settings row can forget. */
     writeModuleConfig();

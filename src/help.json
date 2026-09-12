@@ -589,7 +589,21 @@
             "Shift+Delete:",
             " delete highlighted",
             " song (blocked if",
-            " it's the only one)."
+            " it's the only one).",
+            "",
+            "The song list is also",
+            "editable from a",
+            "browser: Schwung web",
+            "UI, /api/remote-ui/",
+            "module-assets/m8/",
+            "web_ui.html. Add,",
+            "rename, reorder and",
+            "delete songs there;",
+            "the module picks the",
+            "change up within a",
+            "couple of seconds,",
+            "unless a screen is",
+            "open here."
           ]
         },
         {
