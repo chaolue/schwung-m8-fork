@@ -491,16 +491,25 @@ function traceWrite(line) {
  * log is small (a few lines per screen change) and only written while
  * tracing, so the cost is irrelevant next to losing the history on every
  * flush. */
+/* What has already been written, kept in memory.
+ *
+ * This used to re-READ the whole log on every flush, because std has
+ * no append mode here - fine when a flush only happened at the end of
+ * a window, and not fine once flushing moved onto a two-second timer:
+ * a read plus a full rewrite, blocking, on the UI tick, in the same
+ * seconds the nudge is counting ticks and the M8 is painting. It
+ * changed the behaviour of the thing it was measuring. */
+let traceWritten = "";
+
 function traceFlush() {
     if (!traceOn || !tracePending.length) return;
-    const path = tracePath("trace.log");
-    const previous = std.loadFile(path) || "";
-    const f = std.open(path, "w");
+    traceWritten += tracePending.join("\n") + "\n";
+    tracePending = [];
+    const f = std.open(tracePath("trace.log"), "w");
     if (f) {
-        f.puts(previous + tracePending.join("\n") + "\n");
+        f.puts(traceWritten);
         f.close();
     }
-    tracePending = [];
 }
 
 /* Start collecting the lit set for the screen just entered. */
