@@ -164,13 +164,22 @@ const RGB_GREY = 118;          /* #595959 */
 const RGB_WHITE = 120;         /* #FFFFFF */
 
 /* Kept for the LPP colour map below, which addresses pads only. */
-const light_grey = 0x7c;
-const dim_grey = 0x10;
+/* Only the LPP colour map uses these two now, and only as MOVE PALETTE
+ * indices - the led call sites take a level through ledFor() instead.
+ * It was 0x7c, a brightness, which as a palette entry is #141414 -
+ * lit, technically. The edge buttons carry it, and that is most of why
+ * they could not be seen. */
+const chrome_dim = 123;        /* #404040 - visible in a lit room */
 const green = 0x7e;
 const navy = 0x7d;
 const sky = 0x5f;
 const red = 0x7f;
-const blue = 0x5f;
+/* THE CURSOR AND THE TRACK BUTTONS ARE BOTH THIS COLOUR (LPP 78), which
+ * is why one value answered two separate reports: a pulsing edit-mode
+ * cursor that looked white and static beside the white chain pads, and
+ * a right-hand column too dim to read. It was 0x5f - #134566 - which is
+ * a blue only in the sense that black is. */
+const blue = 16;               /* #31ADFF azure blue */
 const azure = 0x63;
 const white = 0x7a;
 const pink = 0x6d;
@@ -251,9 +260,19 @@ function disarmAnimatedPads() {
     animatedPads.clear();
 }
 
-/* Color mapping */
+/* Launchpad colour -> Move palette index.
+ *
+ * TWO DIFFERENT 128-COLOUR TABLES, so an entry missing here does not
+ * degrade to an approximate hue - it falls through as a raw index into
+ * Move's palette and lands somewhere unrelated.
+ *
+ * A traced M8 sends 1, 3, 5, 21, 23, 57, 71 and 78; all are covered.
+ * Read against Grahack's M8_LPP_recap they mean: 3 white (non-empty
+ * chains), 21 green (chains playing), 71 dark pink (empty chains),
+ * 78 blue (the edit-mode cursor, and the track buttons), 1 the dim
+ * chrome on the edge buttons. */
 const lppColorToMoveColorMap = new Map([
-    [0x15, green], [0x17, lime], [0x1, light_grey], [0x05, red], [0x39, red], [0x03, white], [0x4e, blue],
+    [0x15, green], [0x17, lime], [0x1, chrome_dim], [0x05, red], [0x39, red], [0x03, white], [0x4e, blue],
     [0x47, pink], [0x13, aqua], [0x27, blue], [0x2b, azure], [0x16, fern]
 ]);
 
