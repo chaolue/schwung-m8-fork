@@ -1126,6 +1126,14 @@ function makeSongId() {
 /* Abbreviated because they are drawn in a LIST's value column, which is
  * what is left after the label and the label floor: "Absolute" beside
  * "Mstr Mode" ran off the right edge of the screen. */
+/* RELATIVE IS NOT FOR THE M8. Its learn system maps a CC to a parameter
+ * and reads the value absolutely, so a knob left on Rel does nothing
+ * over there. The mode is kept because these CCs go out on an ordinary
+ * MIDI channel and can drive OTHER GEAR on the same wire, some of which
+ * would rather have an encoder's movement than its position - so the
+ * relative branches in handleSongKnobTurn, revertAuditionedKnobs and
+ * revertMasterAudition are deliberate, not leftovers. Absolute is the
+ * default and the only mode that works with the M8 itself. */
 const KNOB_MODE_OPTIONS = ["Abs", "Rel"];
 const KNOB_MODE_ABSOLUTE = 0;
 const KNOB_MODE_RELATIVE = 1;

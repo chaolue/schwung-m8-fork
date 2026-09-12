@@ -110,6 +110,10 @@ chosen from the catalogue on the Move, and so is the picture a group of knobs dr
 shown here and carried through untouched. What this page edits is the name, the CC, the send
 mode and the value display, plus adding, removing and moving between slots.</p>
 
+<p class="note"><strong>Absolute</strong> is the send mode the M8 reads: it learns a CC and takes
+the value as sent. <strong>Relative</strong> sends the movement instead and does nothing on the
+M8 — it is there for other gear sharing the wire.</p>
+
 <ol class="songs" id="list"></ol>
 
 <script>
@@ -335,7 +339,8 @@ function renderSlot(song, page, pi, si, dupes) {
         mode.appendChild(o);
     });
     mode.value = String(knob.mode || 0);
-    mode.title = "Absolute sends the value; Relative sends the movement";
+    mode.title = "Absolute sends the value - the only mode the M8 reads. " +
+                 "Relative sends the movement, for other gear on the wire.";
     mode.addEventListener("change", function () { knob.mode = parseInt(mode.value, 10); markDirty(); });
     row.appendChild(mode);
 

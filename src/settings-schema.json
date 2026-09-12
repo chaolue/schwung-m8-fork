@@ -32,10 +32,16 @@
             "key": "master_mode",
             "label": "Main Knob Send Mode",
             "type": "enum",
-            "options": ["Absolute", "Relative"],
-            "values": ["absolute", "relative"],
+            "options": [
+                "Absolute",
+                "Relative"
+            ],
+            "values": [
+                "absolute",
+                "relative"
+            ],
             "default": "absolute",
-            "help": "Absolute sends the knob's position; Relative sends the movement and lets the M8 accumulate."
+            "help": "Absolute sends the knob's position and is the only mode the M8 reads - its learn system takes the value as sent. Relative sends the movement instead, for other gear sharing the MIDI wire."
         },
         {
             "key": "odd_rows",
