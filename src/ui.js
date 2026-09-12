@@ -794,6 +794,39 @@ function tickSongStepLeds() {
     if (songStepLedReassert % SONG_STEP_LED_REASSERT_EVERY === 0) updateSongStepLeds(true);
 }
 
+/* THE PADS HAVE THE SAME PROBLEM, and it is worse for them.
+ *
+ * The M8 paints its grid once and then sends only changes, so the
+ * opening paint is the whole picture - and it arrives while the host is
+ * still clearing LEDs for the module. Whatever lands before the clear
+ * is wiped, and the M8 has no reason to send it again. The pads then
+ * stay dark until something forces a repaint: a button press, a page
+ * change, or toggling the integration off and on at the M8 end. All
+ * three are just ways of making the M8 talk again.
+ *
+ * Nothing is lost though - every LED the M8 sends is remembered in
+ * lppNoteValueMap whether or not it reached the pads - so replaying
+ * that cache a few times across the first couple of seconds puts the
+ * grid back without the M8 having to do anything. */
+const PAD_REASSERT_TICKS = 150;
+const PAD_REASSERT_EVERY = 30;
+let padReassert = 0;
+
+function tickPadReassert() {
+    if (padReassert <= 0) return;
+    /* Tested BEFORE the decrement, so the first sweep goes out on the
+     * very next tick rather than a period later - the clear may
+     * already have happened by the time we are connected. */
+    const due = padReassert % PAD_REASSERT_EVERY === 0;
+    padReassert--;
+    if (!due) return;
+    /* The buttons down the sides come from the same cache and were
+     * cleared by the same sweep. */
+    queuePadRedraw();
+    updateMoveViewPulse();
+    updatePLAYLed();
+}
+
 /* Pressing one of those buttons switches song. Silent for a button with
  * no song behind it rather than wrapping or clamping onto another song -
  * an empty preset should do nothing, not something surprising. */
@@ -840,6 +873,7 @@ function markM8Connected() {
     }
     updateSongStepLeds(true);
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
+    padReassert = PAD_REASSERT_TICKS;
 }
 
 function initLPP() {
@@ -3876,6 +3910,7 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
+    tickPadReassert();
     tickPadAnimation();
     drainPadRedraw();
     tickSongStepLeds();
