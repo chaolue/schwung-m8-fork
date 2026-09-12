@@ -12,7 +12,7 @@ import {
     MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete,
     MoveMainButton, MoveMainTouch, MoveMainKnob,
     MovePlay, MoveRec, MoveLoop, MoveMute, MoveUndo,
-    MovePad32, MidiClock, MoveRGBLeds, Pulse2th, Blink4th
+    MovePad32, MidiClock, MoveRGBLeds
 } from '/data/UserData/schwung/shared/constants.mjs';
 import { setLED, setButtonLED, decodeDelta } from '/data/UserData/schwung/shared/input_filter.mjs';
 import { buildMetaIndex } from '/data/UserData/schwung/shared/param_pages/param_meta.mjs';
@@ -219,80 +219,55 @@ function ledFor(control, level) {
     return rgb ? RGB_GREY : WHITE_DIM;
 }
 
-/* ------------------------------------------------------- pad animations
+/* Which LPP channels mean "animate this pad".
  *
  * A Launchpad carries the animation in the MIDI CHANNEL of the LED
- * message: channel 0 is static, 1 is flashing, 2 is pulsing. M8 uses it -
+ * message: channel 1 is static, 2 is flashing, 3 is pulsing. M8 uses it -
  * a selected chain or phrase is sent flashing, and so is every other
- * place that chain appears - and the CONTROL path has always honoured it
- * (see the 0x91 branch at the end of applyLppLed). The PAD path threw it
- * away and relayed everything static, which is why the selection never
- * blinked.
+ * place that chain appears - and the CONTROL path has always honoured
+ * it (see the 0x91 branch at the end of applyLppLed). The PAD path
+ * threw it away and relayed everything static, which is why the
+ * selection never moved.
  *
- * Move encodes its own animations the same way, in the channel nibble
- * (constants.mjs, "LED Animations"), and the idiom is two writes: the
- * colour on channel 0, then the SECOND colour on the animation channel.
- * Blink4th matches what the control path already uses.
- *
- * The reason this was disabled is real and is handled below rather than
- * by giving up on it: Move's animation is self-sustaining once armed, and
- * M8 does not reliably send a follow-up for a pad it has stopped caring
- * about - so an armed pad could animate forever. animatedPads remembers
- * what is armed so it can be taken back off. */
-const LPP_PAD_ANIMATION = {
-    0x91: Blink4th,
-    0x92: Pulse2th,
-};
+ * The value is only a flag here: what the pad then does is decided by
+ * tickPadAnimation below, not by Move's own transition. */
+const LPP_PAD_ANIMATED = { 0x91: true, 0x92: true };
 
-/* Move notes currently carrying an animation. */
-const animatedPads = new Set();
+/* --------------------------------------------------- pad animation
+ *
+ * ANIMATED IN SOFTWARE, not by the hardware transition.
+ *
+ * Move inherits Push 2's LED transitions and they are documented
+ * (AbletonPush2MIDIDisplayInterface, "LED animation"): base colour on
+ * channel 0, then target and transition type on channels 1-15, and a
+ * channel-0 write stops a running transition. Three attempts at
+ * driving that produced three wrong pictures on the device - both
+ * colours in one frame lost the base, target-then-base stopped the
+ * animation dead, and base-then-target went back to transitioning from
+ * whatever the M8 had painted. The M8 repaints these pads on its own
+ * schedule, and every one of those repaints is a channel-0 write, so
+ * the base a transition starts from is never reliably ours.
+ *
+ * Toggling the colour ourselves removes the whole question. It costs
+ * one write per animated pad per flip - a handful of pads a few times
+ * a second - and it cannot be undone by an M8 repaint, because the
+ * next flip overwrites it.
+ */
 
-/* Animation targets waiting for the frame AFTER their base colour.
- *
- * Move inherits Push 2's LED protocol, which is explicit about this
- * (AbletonPush2MIDIDisplayInterface, "LED animation"):
- *
- *   "The starting color of an animation is sent with a note on or
- *    control change message on channel 0. The second color, the
- *    transition type and duration of the animation are sent with a
- *    note on or control change message on channel 1...15."
- *
- * So the base comes FIRST and the target second - an animation is a
- * transition between the two. And they cannot share a frame: Move
- * keeps only the last write per note per flush, so a base and a target
- * sent together lose the base, leaving the pad transitioning from
- * whatever the M8 had last painted it. That is what made the cursor
- * pulse from white or dark pink no matter which base colour was
- * chosen.
- *
- * The same document also says "transitions are stopped by setting a
- * color on channel 0", which is why sending the base second - the
- * previous attempt - stopped the animation outright and left solid
- * colours. */
-const pendingPadAnim = new Map();
-
-function drainPendingPadAnim() {
-    if (!pendingPadAnim.size) return;
-    for (const [note, target] of pendingPadAnim) {
-        move_midi_internal_send([0x09, 0x90 | target[0], note, target[1]]);
-    }
-    pendingPadAnim.clear();
-}
-
-/* What a pulsing pad alternates WITH: a near neighbour of the same hue
+/* What a flashing pad alternates WITH: a near neighbour of the same hue
  * at a clearly different brightness, so the pad reads as one pad
  * breathing rather than as two pads taking turns.
  *
  * Picked by hand rather than derived. The palette's 26 saturated
- * colours do carry a regular dim partner (63 + 2c), but the colours
- * this module pulses are not all in that range - the pure primaries at
- * 125-127 and the greys sit outside it - and where the formula did
- * apply it chose partners so dark they read as black: azure against
- * #134566 looked like blue-to-off rather than a pulse.
+ * colours do carry a regular dim partner (63 + 2c), and that is still
+ * the fallback, but the colours this module flashes are not all in
+ * that range - the pure primaries and the greys sit outside it - and
+ * where the formula did apply it chose partners so dark they read as
+ * off: azure against #134566 looked like blue-to-nothing.
  *
- * For a colour that is ALREADY dark the partner is brighter instead.
- * Direction does not matter to the hardware, which simply alternates
- * the two; what matters is that both ends are visible and share a hue. */
+ * A colour that is ALREADY dark takes a BRIGHTER partner instead.
+ * Direction does not matter - the pad alternates between the two
+ * either way - only that both ends are lit and share a hue. */
 const PULSE_PARTNER = {
     0x7a: 118,     /* white   #CCCCCC -> #595959 mid grey, not near-black */
     120: 118,      /* white   #FFFFFF -> #595959 */
@@ -314,35 +289,43 @@ function pulsePartnerOf(colour) {
     return black;
 }
 
-/* Take every animation back off. Called before a full repaint, which is
- * what makes a view change safe: the pads are about to show DIFFERENT
- * LPP notes, so an animation armed for the old note would otherwise keep
- * running under the new one, and no message from M8 would ever stop it.
- * The repaint immediately behind this re-arms whatever M8's current state
- * actually says. */
-/* Stop one pad animating, by setting the animation slot to the SAME
- * colour as the base: the hardware keeps alternating, between two
- * identical colours, which is indistinguishable from static.
- *
- * Channel 0 is NoAnimation and ought to be the disarm, but on Move it
- * is not - it changes the colour and leaves the animation running. That
- * is also the whole of the "pads stuck flashing" this relay was
- * originally disabled over. */
-/* "Transitions are stopped by setting a color on channel 0" - so the
- * disarm is one ordinary write, and any target still queued for this
- * pad has to be dropped or it would restart the animation next frame. */
-function disarmPad(note, colour) {
-    pendingPadAnim.delete(note);
-    move_midi_internal_send([0x09, 0x90, note, colour]);
-    animatedPads.delete(note);
+/* Move note -> the two colours it alternates between. */
+const animatedPads = new Map();
+
+/* Ticks per flip. The module ticks at about 44 Hz, so this is a little
+ * over four flips a second: fast enough to read as alive, slow enough
+ * not to strobe. */
+const PAD_FLIP_TICKS = 10;
+let padFlipCount = 0;
+let padFlipOn = false;
+
+/* Only writes on the frames the phase actually changes, so a steady
+ * screen costs nothing between flips. */
+function tickPadAnimation() {
+    if (!animatedPads.size) { padFlipCount = 0; padFlipOn = false; return; }
+    if (++padFlipCount < PAD_FLIP_TICKS) return;
+    padFlipCount = 0;
+    padFlipOn = !padFlipOn;
+    for (const [note, pair] of animatedPads) {
+        move_midi_internal_send([0x09, 0x90, note, padFlipOn ? pair[1] : pair[0]]);
+    }
 }
 
+/* Stop a pad animating and leave it on `colour`. */
+function disarmPad(note, colour) {
+    animatedPads.delete(note);
+    move_midi_internal_send([0x09, 0x90, note, colour]);
+}
+
+/* Take every animation off before a full repaint. A view change points
+ * the same physical pad at a different LPP note, so an animation left
+ * running would keep flipping under the new one. */
 function disarmAnimatedPads() {
-    for (const note of [...animatedPads]) disarmPad(note, black);
+    for (const note of animatedPads.keys()) {
+        move_midi_internal_send([0x09, 0x90, note, black]);
+    }
     animatedPads.clear();
 }
-
-
 
 /* Launchpad colour -> Move palette index.
  *
@@ -3549,7 +3532,7 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
     if (moveNoteNumber) {
-        const anim = LPP_PAD_ANIMATION[value];
+        const anim = LPP_PAD_ANIMATED[value];
         if (anim) {
             /* THE COLOUR GOES ON THE ANIMATION SLOT, not on the base.
              *
@@ -3567,20 +3550,18 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
              * alone the pad breathes blue, and if M8 repaints it the
              * worst case is the previous behaviour rather than a lost
              * cursor. */
-            /* Base now, target next frame - see pendingPadAnim. Both
-             * come from the one colour: the pad transitions between
-             * the colour's partner and the colour itself, so it
-             * breathes in its own hue. */
-            move_midi_internal_send([0x09, 0x90, moveNoteNumber, pulsePartnerOf(moveVelocity)]);
-            pendingPadAnim.set(moveNoteNumber, [anim, moveVelocity]);
-            animatedPads.add(moveNoteNumber);
+            /* Both ends come from the one colour, so the pad breathes
+             * in its own hue rather than alternating with whatever the
+             * chain underneath happened to be. Painted immediately so
+             * it does not wait up to a flip to appear. */
+            const partner = pulsePartnerOf(moveVelocity);
+            animatedPads.set(moveNoteNumber, [partner, moveVelocity]);
+            move_midi_internal_send([0x09, 0x90, moveNoteNumber, moveVelocity]);
+            padFlipOn = true;
+            padFlipCount = 0;
             return;
         }
-        /* A channel-0 write IS the stop, so this one message both
-         * repaints the pad and ends any transition on it. The queued
-         * target has to go, though, or it would start a new one on the
-         * next frame. */
-        pendingPadAnim.delete(moveNoteNumber);
+        /* A plain colour from M8 ends any animation on that pad. */
         animatedPads.delete(moveNoteNumber);
         move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
         return;
@@ -3875,7 +3856,7 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
-    drainPendingPadAnim();
+    tickPadAnimation();
     drainPadRedraw();
     tickSongStepLeds();
     drawUI();
