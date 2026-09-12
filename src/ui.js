@@ -293,15 +293,29 @@ function pulsePartnerOf(colour) {
 const animatedPads = new Map();
 
 /* Ticks per flip. The module ticks at about 44 Hz, so this is a little
- * over four flips a second: fast enough to read as alive, slow enough
- * not to strobe. */
-const PAD_FLIP_TICKS = 10;
+ * under three flips a second. Ten read as too fast on the device. */
+const PAD_FLIP_TICKS = 16;
 let padFlipCount = 0;
 let padFlipOn = false;
+
+/* Pads the M8 has painted statically, waiting to see whether a re-arm
+ * follows in the same refresh - see the static branch of applyLppLed.
+ * Value is the colour to paint if the stop does stand. */
+const padStopPending = new Map();
+
+function applyPendingPadStops() {
+    if (!padStopPending.size) return;
+    for (const [note, colour] of padStopPending) {
+        animatedPads.delete(note);
+        move_midi_internal_send([0x09, 0x90, note, colour]);
+    }
+    padStopPending.clear();
+}
 
 /* Only writes on the frames the phase actually changes, so a steady
  * screen costs nothing between flips. */
 function tickPadAnimation() {
+    applyPendingPadStops();
     if (!animatedPads.size) { padFlipCount = 0; padFlipOn = false; return; }
     if (++padFlipCount < PAD_FLIP_TICKS) return;
     padFlipCount = 0;
@@ -314,6 +328,7 @@ function tickPadAnimation() {
 /* Stop a pad animating and leave it on `colour`. */
 function disarmPad(note, colour) {
     animatedPads.delete(note);
+    padStopPending.delete(note);
     move_midi_internal_send([0x09, 0x90, note, colour]);
 }
 
@@ -325,6 +340,7 @@ function disarmAnimatedPads() {
         move_midi_internal_send([0x09, 0x90, note, black]);
     }
     animatedPads.clear();
+    padStopPending.clear();
 }
 
 /* Launchpad colour -> Move palette index.
@@ -3534,35 +3550,39 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     if (moveNoteNumber) {
         const anim = LPP_PAD_ANIMATED[value];
         if (anim) {
-            /* THE COLOUR GOES ON THE ANIMATION SLOT, not on the base.
+            /* Both ends come from the one colour, so the pad flashes in
+             * its own hue rather than alternating with whatever the
+             * chain underneath happened to be.
              *
-             * The base is M8's to own: it repaints the cursor pad with
-             * the chain's own colour whenever the grid refreshes, and it
-             * does so AFTER telling us to animate. Writing the cursor
-             * colour to the base meant that repaint took it straight
-             * back off - the pad pulsed, correctly, in whatever colour
-             * the chain already was (white for a used chain, dark pink
-             * for an empty one) and never in blue.
-             *
-             * Putting the colour here instead survives those repaints.
-             * The base is written too, but to the colour's own DIM
-             * partner rather than to the colour - so if M8 leaves it
-             * alone the pad breathes blue, and if M8 repaints it the
-             * worst case is the previous behaviour rather than a lost
-             * cursor. */
-            /* Both ends come from the one colour, so the pad breathes
-             * in its own hue rather than alternating with whatever the
-             * chain underneath happened to be. Painted immediately so
-             * it does not wait up to a flip to appear. */
-            const partner = pulsePartnerOf(moveVelocity);
-            animatedPads.set(moveNoteNumber, [partner, moveVelocity]);
-            move_midi_internal_send([0x09, 0x90, moveNoteNumber, moveVelocity]);
-            padFlipOn = true;
-            padFlipCount = 0;
+             * A REPEAT of the same request must not restart anything.
+             * M8 re-sends its overlays on every grid refresh, and
+             * during playback that is far more often than the flip
+             * period - so resetting the phase here held the pad on one
+             * colour and it never appeared to flash at all. The phase
+             * is global and free-running; a pad only paints itself
+             * immediately the first time, so the flash starts without
+             * waiting a full period. */
+            padStopPending.delete(moveNoteNumber);
+            const already = animatedPads.has(moveNoteNumber);
+            animatedPads.set(moveNoteNumber, [pulsePartnerOf(moveVelocity), moveVelocity]);
+            if (!already) {
+                move_midi_internal_send([0x09, 0x90, moveNoteNumber, moveVelocity]);
+            }
             return;
         }
-        /* A plain colour from M8 ends any animation on that pad. */
-        animatedPads.delete(moveNoteNumber);
+        /* A plain colour ends the flash - but NOT immediately. M8
+         * repaints the whole grid and then re-sends its overlays, so a
+         * flashing pad receives a static write on every refresh and
+         * acting on it at once would cancel the flash a moment before
+         * it is asked for again. Painting it would also show the chain
+         * colour for a frame, which is the flicker this is all about.
+         *
+         * So the stop is remembered and applied on the next tick, by
+         * which time the re-arm has either arrived or it has not. */
+        if (animatedPads.has(moveNoteNumber)) {
+            padStopPending.set(moveNoteNumber, moveVelocity);
+            return;
+        }
         move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
         return;
     }
