@@ -306,9 +306,13 @@ function pulsePartnerOf(colour) {
 /* Move note -> the two colours it alternates between. */
 const animatedPads = new Map();
 
-/* Ticks per flip. The module ticks at about 44 Hz, so this is a little
- * under three flips a second. Ten read as too fast on the device. */
-const PAD_FLIP_TICKS = 16;
+/* Ticks per flip. The module ticks at about 44 Hz, so this is about
+ * one and a half flips a second - a pulse of roughly 0.8 Hz.
+ *
+ * Tuned on the device three times: 10 was far too fast, 16 still read
+ * as a flicker rather than a pulse. Raise it further to slow it down;
+ * nothing else depends on the number. */
+const PAD_FLIP_TICKS = 28;
 let padFlipCount = 0;
 let padFlipOn = false;
 
