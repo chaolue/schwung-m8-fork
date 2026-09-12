@@ -4441,7 +4441,8 @@ globalThis.onMidiMessageInternal = function (data) {
             if (moveControlNumber === moveSHIFT) {
                 shiftHeld = true;
             }
-            /* THE ODD VIEW SCROLLS TWO ROWS AT A TIME.
+            /* THE ODD VIEW SCROLLS TWO ROWS AT A TIME - BUT ONLY THE
+             * PLAIN ARROW.
              *
              * It shows M8 rows 0, 2, 4, 6 - every other one - so a
              * one-row scroll swaps which rows are on screen and the
@@ -4449,8 +4450,13 @@ globalThis.onMidiMessageInternal = function (data) {
              * four even rows up, which is what the view is for. Sent
              * as a complete extra press before the real one, so the
              * release that follows completes the second of two rather
-             * than leaving a key down. */
-            if (viewMode === VIEW_ODD
+             * than leaving a key down.
+             *
+             * Shift+arrow is already a PAGE - eight M8 rows - and eight
+             * rows is exactly what this view spans, so it lands on the
+             * next screenful on its own. Doubling that moved sixteen
+             * and skipped a whole screen. */
+            if (viewMode === VIEW_ODD && !shiftHeld
                 && (moveControlNumber === MoveUp || moveControlNumber === MoveDown)) {
                 pressOnM8(lppNote);
             }
