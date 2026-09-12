@@ -12,7 +12,7 @@ import {
     MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete,
     MoveMainButton, MoveMainTouch, MoveMainKnob,
     MovePlay, MoveRec, MoveLoop, MoveMute, MoveUndo,
-    MovePad32, MidiClock, MoveRGBLeds
+    MovePad32, MidiClock, MoveRGBLeds, Pulse2th, Blink4th
 } from '/data/UserData/schwung/shared/constants.mjs';
 import { setLED, setButtonLED, decodeDelta } from '/data/UserData/schwung/shared/input_filter.mjs';
 import { buildMetaIndex } from '/data/UserData/schwung/shared/param_pages/param_meta.mjs';
@@ -201,6 +201,47 @@ function ledFor(control, level) {
     if (level === "dim") return rgb ? RGB_DIM_GREY : WHITE_DIM;
     if (level === "bright") return rgb ? RGB_WHITE : WHITE_BRIGHT;
     return rgb ? RGB_GREY : WHITE_DIM;
+}
+
+/* ------------------------------------------------------- pad animations
+ *
+ * A Launchpad carries the animation in the MIDI CHANNEL of the LED
+ * message: channel 0 is static, 1 is flashing, 2 is pulsing. M8 uses it -
+ * a selected chain or phrase is sent flashing, and so is every other
+ * place that chain appears - and the CONTROL path has always honoured it
+ * (see the 0x91 branch at the end of applyLppLed). The PAD path threw it
+ * away and relayed everything static, which is why the selection never
+ * blinked.
+ *
+ * Move encodes its own animations the same way, in the channel nibble
+ * (constants.mjs, "LED Animations"), and the idiom is two writes: the
+ * colour on channel 0, then the SECOND colour on the animation channel.
+ * Blink4th matches what the control path already uses.
+ *
+ * The reason this was disabled is real and is handled below rather than
+ * by giving up on it: Move's animation is self-sustaining once armed, and
+ * M8 does not reliably send a follow-up for a pad it has stopped caring
+ * about - so an armed pad could animate forever. animatedPads remembers
+ * what is armed so it can be taken back off. */
+const LPP_PAD_ANIMATION = {
+    0x91: Blink4th,
+    0x92: Pulse2th,
+};
+
+/* Move notes currently carrying an animation. */
+const animatedPads = new Set();
+
+/* Take every animation back off. Called before a full repaint, which is
+ * what makes a view change safe: the pads are about to show DIFFERENT
+ * LPP notes, so an animation armed for the old note would otherwise keep
+ * running under the new one, and no message from M8 would ever stop it.
+ * The repaint immediately behind this re-arms whatever M8's current state
+ * actually says. */
+function disarmAnimatedPads() {
+    for (const note of animatedPads) {
+        move_midi_internal_send([0x09, 0x90, note, black]);
+    }
+    animatedPads.clear();
 }
 
 /* Color mapping */
@@ -491,6 +532,7 @@ let padRedrawIndex = 0;
 const PAD_REDRAW_PER_FRAME = 8;
 
 function queuePadRedraw() {
+    disarmAnimatedPads();
     let activeMoveToLppPadMap = padMapMoveToLpp();
     padRedrawEntries = [...activeMoveToLppPadMap.entries()];
     padRedrawIndex = 0;
@@ -3350,17 +3392,18 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
     if (moveNoteNumber) {
-        /* Always relay as a plain static (channel 0) write. Move's per-note
-         * Blink2th/Pulse2th animation (channels 15/10) is self-sustaining once
-         * armed - it keeps animating with no further MIDI needed - but M8 does
-         * not reliably send a follow-up for a note once it stops being
-         * relevant (confirmed: pads stayed lit through 2+ minutes with zero
-         * MIDI traffic for that note). Arming it is what leaves pads stuck
-         * flashing indefinitely. M8 already creates its own pulse/flash look
-         * by periodically resending the note with alternating velocity, so a
-         * plain relay reproduces that and correctly goes static the moment M8
-         * stops updating the note - nothing left running on its own to get stuck. */
+        /* The colour first, always, as a plain static write. Then the
+         * animation, if M8 asked for one - see LPP_PAD_ANIMATION. */
         move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
+        const anim = LPP_PAD_ANIMATION[value];
+        if (anim) {
+            move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, black]);
+            animatedPads.add(moveNoteNumber);
+        } else {
+            /* A static update IS the disarm: channel 0 is NoAnimation, so
+             * the write above already stopped it. Just stop tracking. */
+            animatedPads.delete(moveNoteNumber);
+        }
         return;
     }
 
