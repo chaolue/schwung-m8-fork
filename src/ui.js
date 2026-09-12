@@ -47,13 +47,21 @@ const lppNotes = [
 
 const lppNoteValueMap = new Map([...lppNotes.map((a) => [a, [0, 0, 0]])]);
 
+/* The Launchpad's logo led, which M8 uses to show LIVE MODE. CC 31 is
+ * the led BELOW step 16 - not note 31, which is step 16 itself and is
+ * the eighth song-preset button. Notes and CCs are separate address
+ * spaces on Move, so the two 31s are different leds and do not collide.
+ *
+ * It was on CC 99, which is a pad. */
+const moveLOGO = 31;
+
 /* Move control to LPP note mapping (top view) */
 const moveControlToLppNoteMapTop = new Map([
     [55, 80], [54, 70], [62, 91], [63, 92], [85, 20],
     [43, 89], [42, 79], [41, 69], [40, 59],
     [50, 94], [49, 90], [119, 60], [51, 93], [52, 97],
     [88, 2], [56, 1], [86, 10], [60, 50], [58, 3],
-    [118, 98], [99, 99]
+    [118, 98], [moveLOGO, 99]
 ]);
 
 const lppNoteToMoveControlMapTop = new Map([...moveControlToLppNoteMapTop.entries()].map((a) => [a[1], a[0]]));
@@ -64,7 +72,7 @@ const moveControlToLppNoteMapBottom = new Map([
     [43, 49], [42, 39], [41, 29], [40, 19],
     [50, 94], [49, 90], [119, 60], [51, 93], [52, 97],
     [88, 2], [56, 1], [86, 10], [60, 50], [58, 3],
-    [118, 98], [99, 99]
+    [118, 98], [moveLOGO, 99]
 ]);
 
 const lppNoteToMoveControlMapBottom = new Map([...moveControlToLppNoteMapBottom.entries()].map((a) => [a[1], a[0]]));
@@ -77,7 +85,7 @@ const moveControlToLppNoteMapOdd = new Map([
     [43, 89], [42, 69], [41, 49], [40, 29],
     [50, 94], [49, 90], [119, 60], [51, 93], [52, 97],
     [88, 2], [56, 1], [86, 10], [60, 50], [58, 3],
-    [118, 98], [99, 99]
+    [118, 98], [moveLOGO, 99]
 ]);
 
 const lppNoteToMoveControlMapOdd = new Map([...moveControlToLppNoteMapOdd.entries()].map((a) => [a[1], a[0]]));
@@ -173,7 +181,6 @@ const lime = 0x20;
 const fern = 0x55;
 
 /* Alias imported constants for local usage */
-const moveLOGO = MovePad32;
 const moveMENU = MoveMenu;
 const moveBACK = MoveBack;
 const moveCAP = MoveCapture;
