@@ -170,13 +170,10 @@ const RGB_WHITE = 120;         /* #FFFFFF */
  * lit, technically. The edge buttons carry it, and that is most of why
  * they could not be seen. */
 const chrome_dim = 123;        /* #404040 - visible in a lit room */
-/* In the 1-26 range, where each colour has a dim and a dark partner -
- * see dimPartnerOf. 0x7e was #00FF00, a pure primary outside that
- * range and so with nothing to pulse against. */
-const green = 10;              /* #79FF18 dull green */
+const green = 0x7e;            /* #00FF00 */
 const navy = 0x7d;
 const sky = 0x5f;
-const red = 1;                 /* #FF4032 bright red */
+const red = 0x7f;              /* #FF0000 */
 /* THE CURSOR AND THE TRACK BUTTONS ARE BOTH THIS COLOUR (LPP 78), which
  * is why one value answered two separate reports: a pulsing edit-mode
  * cursor that looked white and static beside the white chain pads, and
@@ -250,18 +247,39 @@ const LPP_PAD_ANIMATION = {
 /* Move notes currently carrying an animation. */
 const animatedPads = new Set();
 
-/* The palette's 26 saturated colours each come with a DIM and a DARK
- * partner, laid out regularly: dim = 63 + 2c, dark = 64 + 2c. Pulsing a
- * colour against its own dim partner is what a Launchpad does - the pad
- * breathes in its own hue - where pulsing against the pad's existing
- * colour reads as two pads taking turns.
+/* What a pulsing pad alternates WITH: a near neighbour of the same hue
+ * at a clearly different brightness, so the pad reads as one pad
+ * breathing rather than as two pads taking turns.
  *
- * Greys are not in that range and have no partner, so they fall back to
- * the darkest grey; anything else falls back to black. */
-const DIM_PARTNER_GREY = { 118: 119, 120: 119, 121: 119, 122: 119, 123: 124 };
-function dimPartnerOf(colour) {
+ * Picked by hand rather than derived. The palette's 26 saturated
+ * colours do carry a regular dim partner (63 + 2c), but the colours
+ * this module pulses are not all in that range - the pure primaries at
+ * 125-127 and the greys sit outside it - and where the formula did
+ * apply it chose partners so dark they read as black: azure against
+ * #134566 looked like blue-to-off rather than a pulse.
+ *
+ * For a colour that is ALREADY dark the partner is brighter instead.
+ * Direction does not matter to the hardware, which simply alternates
+ * the two; what matters is that both ends are visible and share a hue. */
+const PULSE_PARTNER = {
+    0x7a: 118,     /* white   #CCCCCC -> #595959 mid grey, not near-black */
+    120: 118,      /* white   #FFFFFF -> #595959 */
+    0x7e: 83,      /* green   #00FF00 -> #306609 */
+    0x7f: 65,      /* red     #FF0000 -> #661914 */
+    16: 20,        /* azure   #31ADFF -> #153999 a deeper blue, still lit */
+    32: 12,        /* deep green #007F12 -> #4F8A04, brighter: it is dark already */
+    109: 23,       /* dim pink   #3C1166 -> #972BFF */
+    95: 16,        /* dim azure  #134566 -> #31ADFF */
+    85: 11,        /* dim green  #144D08 -> #34C216 */
+    90: 13,        /* dark teal  #0C210B -> #62FF55 */
+    99: 18,        /* dim violet #0A1466 -> #1A34FF */
+};
+
+function pulsePartnerOf(colour) {
+    if (PULSE_PARTNER[colour] !== undefined) return PULSE_PARTNER[colour];
+    /* The palette's own dim partner, for any saturated colour not listed. */
     if (colour >= 1 && colour <= 26) return 63 + 2 * colour;
-    return DIM_PARTNER_GREY[colour] !== undefined ? DIM_PARTNER_GREY[colour] : black;
+    return black;
 }
 
 /* Take every animation back off. Called before a full repaint, which is
@@ -3512,11 +3530,11 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
              * alone the pad breathes blue, and if M8 repaints it the
              * worst case is the previous behaviour rather than a lost
              * cursor. */
-            /* BOTH slots, from the one colour: the dim partner
+            /* BOTH slots, from the one colour: the pulse partner
              * underneath and the colour itself on top, so the pad
              * breathes in its own hue instead of alternating with
              * whatever the chain happened to be. */
-            move_midi_internal_send([0x09, 0x90, moveNoteNumber, dimPartnerOf(moveVelocity)]);
+            move_midi_internal_send([0x09, 0x90, moveNoteNumber, pulsePartnerOf(moveVelocity)]);
             move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, moveVelocity]);
             animatedPads.add(moveNoteNumber);
             return;
