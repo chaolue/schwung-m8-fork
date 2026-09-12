@@ -253,10 +253,22 @@ const animatedPads = new Set();
  * running under the new one, and no message from M8 would ever stop it.
  * The repaint immediately behind this re-arms whatever M8's current state
  * actually says. */
+/* Stop one pad animating, by setting the animation slot to the SAME
+ * colour as the base: the hardware keeps alternating, between two
+ * identical colours, which is indistinguishable from static.
+ *
+ * Channel 0 is NoAnimation and ought to be the disarm, but on Move it
+ * is not - it changes the colour and leaves the animation running. That
+ * is also the whole of the "pads stuck flashing" this relay was
+ * originally disabled over. */
+function disarmPad(note, colour) {
+    move_midi_internal_send([0x09, 0x90, note, colour]);
+    move_midi_internal_send([0x09, 0x90 | Pulse2th, note, colour]);
+    animatedPads.delete(note);
+}
+
 function disarmAnimatedPads() {
-    for (const note of animatedPads) {
-        move_midi_internal_send([0x09, 0x90, note, black]);
-    }
+    for (const note of [...animatedPads]) disarmPad(note, black);
     animatedPads.clear();
 }
 
@@ -3465,18 +3477,31 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
     if (moveNoteNumber) {
-        /* The colour first, always, as a plain static write. Then the
-         * animation, if M8 asked for one - see LPP_PAD_ANIMATION. */
-        move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
         const anim = LPP_PAD_ANIMATION[value];
         if (anim) {
-            move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, black]);
+            /* THE COLOUR GOES ON THE ANIMATION SLOT, not on the base.
+             *
+             * The base is M8's to own: it repaints the cursor pad with
+             * the chain's own colour whenever the grid refreshes, and it
+             * does so AFTER telling us to animate. Writing the cursor
+             * colour to the base meant that repaint took it straight
+             * back off - the pad pulsed, correctly, in whatever colour
+             * the chain already was (white for a used chain, dark pink
+             * for an empty one) and never in blue.
+             *
+             * Putting it here instead leaves M8's repaints to the base
+             * where they belong, and the pad alternates between that and
+             * the cursor colour. */
+            move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, moveVelocity]);
             animatedPads.add(moveNoteNumber);
-        } else {
-            /* A static update IS the disarm: channel 0 is NoAnimation, so
-             * the write above already stopped it. Just stop tracking. */
-            animatedPads.delete(moveNoteNumber);
+            return;
         }
+        move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
+        /* A channel-0 write does NOT stop a running animation - it only
+         * changes the colour underneath it, which is exactly how the
+         * cursor came to pulse in the wrong colour. So a pad that was
+         * animated needs telling explicitly. */
+        if (animatedPads.has(moveNoteNumber)) disarmPad(moveNoteNumber, moveVelocity);
         return;
     }
 
