@@ -1,0 +1,48 @@
+{
+    "id": "m8",
+    "label": "M8 LPP Emulator",
+    "items": [
+        {
+            "key": "knob_channel",
+            "label": "Knob MIDI Channel",
+            "type": "int",
+            "min": 1,
+            "max": 16,
+            "default": 4,
+            "help": "Channel the eight song knobs send their CCs on. Must match CONTROL MAP CHANNEL in the M8's MIDI Settings or nothing they send is heard."
+        },
+        {
+            "key": "master_cc",
+            "label": "Main Knob CC",
+            "type": "int",
+            "min": 0,
+            "max": 127,
+            "default": 79,
+            "help": "The Main (volume) knob is a pass-through with its own CC, separate from the eight song knobs."
+        },
+        {
+            "key": "master_channel",
+            "label": "Main Knob MIDI Channel",
+            "type": "int",
+            "min": 1,
+            "max": 16,
+            "default": 4
+        },
+        {
+            "key": "master_mode",
+            "label": "Main Knob Send Mode",
+            "type": "enum",
+            "options": ["Absolute", "Relative"],
+            "values": ["absolute", "relative"],
+            "default": "absolute",
+            "help": "Absolute sends the knob's position; Relative sends the movement and lets the M8 accumulate."
+        },
+        {
+            "key": "odd_rows",
+            "label": "Odd Rows View",
+            "type": "bool",
+            "default": false,
+            "help": "Adds a third pad view on the M8's main Session screen showing every other row, so a whole phrase fits at half resolution."
+        }
+    ]
+}

@@ -1046,6 +1046,9 @@ function markM8Connected() {
     initRetryTicks = 0;
     viewMode = VIEW_TOP;
     loadSongs();
+    /* After the songs, so a value set in a browser wins over the copy
+     * that was written into songs.json when the module last ran. */
+    loadModuleConfig();
     if (traceOn) {
         traceWrite(`=== M8 connected, oddRows ${settings.oddRows} ===`);
         traceScreen("Session (startup)");
@@ -2228,6 +2231,140 @@ function loadSongs() {
     console.log(`loadSongs: ${songs.length} song(s), active="${getActiveSong().name}"`);
 }
 
+
+/* ============================================================================
+ * The same settings, from the web UI.
+ *
+ * Schwung Manager renders a Settings page for any module that ships a
+ * settings-schema.json, and stores what you choose in config.json beside
+ * it. That file is the web UI's only channel: it never talks to a running
+ * module. So the two are kept in step from this side -
+ *
+ *   - config.json is read at startup and applied over the settings, and
+ *     POLLED while running, so a change made in a browser lands on the
+ *     device without a restart;
+ *   - every change made ON the device is written back to config.json, so
+ *     the web page shows what the hardware actually has rather than a
+ *     stale copy.
+ *
+ * Last writer wins, which for a person at one device and one browser is
+ * the behaviour they expect. The file is merged rather than replaced, so
+ * keys this module does not manage survive.
+ *
+ * Channels are stored 1-16 here, matching the schema and how everyone
+ * numbers them; internally they are 0-15.
+ * ============================================================================ */
+
+/* In a function: MODULE_DIR is declared above this, but deriving paths at
+ * call time is the habit that keeps this file free of dead-zone faults. */
+function configPath() {
+    return MODULE_DIR + "/config.json";
+}
+
+/* The raw text last seen, so the poll can ignore our own writes and skip
+ * parsing an unchanged file. */
+let lastConfigRaw = null;
+const CONFIG_POLL_TICKS = 90;        /* ~2s at the module's ~44Hz tick */
+let configPollTicks = 0;
+
+function settingsAsConfig() {
+    return {
+        knob_channel: settings.knobChannel + 1,
+        master_cc: settings.masterCc,
+        master_channel: settings.masterChannel + 1,
+        master_mode: settings.masterMode === KNOB_MODE_RELATIVE ? "relative" : "absolute",
+        odd_rows: !!settings.oddRows,
+    };
+}
+
+/* Returns true if anything actually moved, so a caller knows whether the
+ * pads and leds need catching up. Each key is checked on its own: a
+ * config.json holding only one of them is perfectly legal. */
+function applyConfig(cfg) {
+    if (!cfg || typeof cfg !== "object") return false;
+    let changed = false;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const num = (v) => (typeof v === "number" ? v : parseInt(v, 10));
+
+    if (cfg.knob_channel !== undefined) {
+        const ch = clamp(num(cfg.knob_channel) - 1, 0, 15);
+        if (!isNaN(ch) && ch !== settings.knobChannel) { settings.knobChannel = ch; changed = true; }
+    }
+    if (cfg.master_channel !== undefined) {
+        const ch = clamp(num(cfg.master_channel) - 1, 0, 15);
+        if (!isNaN(ch) && ch !== settings.masterChannel) { settings.masterChannel = ch; changed = true; }
+    }
+    if (cfg.master_cc !== undefined) {
+        const cc = clamp(num(cfg.master_cc), 0, 127);
+        if (!isNaN(cc) && cc !== settings.masterCc) { settings.masterCc = cc; changed = true; }
+    }
+    if (cfg.master_mode !== undefined) {
+        const mode = String(cfg.master_mode) === "relative"
+            ? KNOB_MODE_RELATIVE : KNOB_MODE_ABSOLUTE;
+        if (mode !== settings.masterMode) { settings.masterMode = mode; changed = true; }
+    }
+    if (cfg.odd_rows !== undefined) {
+        const on = cfg.odd_rows === true || cfg.odd_rows === "true" || cfg.odd_rows === 1;
+        if (on !== settings.oddRows) { settings.oddRows = on; changed = true; }
+    }
+    return changed;
+}
+
+function readConfigRaw() {
+    try {
+        return std.loadFile(configPath());
+    } catch (e) {
+        return null;
+    }
+}
+
+function loadModuleConfig() {
+    const raw = readConfigRaw();
+    lastConfigRaw = raw;
+    if (!raw) return;
+    try {
+        applyConfig(std.parseExtJSON(raw));
+    } catch (e) {
+        console.log(`loadModuleConfig: failed to parse ${configPath()}: ${e}`);
+    }
+}
+
+function writeModuleConfig() {
+    let existing = {};
+    const raw = readConfigRaw();
+    if (raw) {
+        try { existing = std.parseExtJSON(raw) || {}; } catch (e) { existing = {}; }
+    }
+    const merged = JSON.stringify(Object.assign({}, existing, settingsAsConfig()));
+    if (merged === lastConfigRaw) return;
+    const f = std.open(configPath(), "w");
+    if (!f) return;
+    f.puts(merged);
+    f.close();
+    lastConfigRaw = merged;
+}
+
+/* A browser can change the file at any moment, so it is watched rather
+ * than read once. Cheap: an unchanged file costs one read every couple
+ * of seconds and no parse. */
+function tickModuleConfig() {
+    if (++configPollTicks < CONFIG_POLL_TICKS) return;
+    configPollTicks = 0;
+    const raw = readConfigRaw();
+    if (raw === lastConfigRaw) return;
+    lastConfigRaw = raw;
+    if (!raw) return;
+    let parsed = null;
+    try { parsed = std.parseExtJSON(raw); } catch (e) { return; }
+    if (!applyConfig(parsed)) return;
+    /* Odd rows may have just been switched off under a view that only
+     * exists while it is on, and the step leds follow the song list. */
+    reconcileOddRowsView();
+    queuePadRedraw();
+    updateMoveViewPulse();
+    markSongsDirty();
+}
+
 function saveSongs() {
     const f = std.open(SONGS_PATH, "w");
     if (!f) {
@@ -2236,6 +2373,9 @@ function saveSongs() {
     }
     f.puts(JSON.stringify({ activeSongId, settings, songs }));
     f.close();
+    /* Mirror the settings out to the web UI's file. Done here rather
+     * than at each edit site so no future settings row can forget. */
+    writeModuleConfig();
 }
 
 function getActiveSong() {
@@ -3517,10 +3657,32 @@ function slotLabelBaseline(slot) {
  * The pill itself is only as wide as its text plus a couple of pixels,
  * rather than the whole cell: a full-width bar reads as a highlighted
  * row, and what is wanted is a badge around the number. */
+/* THE LAST PIXEL ROW OF THE PANEL IS NOT SAFE TO PAINT.
+ *
+ * The bottom cell's label row is y 55 to 63 - exactly the full height -
+ * and a pill drawn there came out on the device as a white line across
+ * the TOP of the screen as well, at the same x. Nothing in the module
+ * or the host renderer draws it (both clip at the buffer edge, and the
+ * draw log has nothing above y=8 at that x), so it is the panel's own
+ * row 63 showing up where it should not. Everything else on this
+ * surface stops at 62 - the footer text included - which is why this
+ * is the first place it has ever shown.
+ *
+ * So the label row is trimmed to end at 62 where it would run to 63.
+ * One pixel off the bottom of a nine-pixel pill is not visible; the
+ * line at the top very much is. */
+const LAST_SAFE_ROW = 62;
+
+function labelRowHeight(top) {
+    return Math.min(LABEL_ROW_H, LAST_SAFE_ROW + 1 - top);
+}
+
 function drawSlotLabel(slot, text, inverted) {
     const cx = slotLabelCentre(slot);
     const y = slotLabelBaseline(slot);
-    fill_rect(Math.round(cx - CELL_W / 2), y - 1, CELL_W, LABEL_ROW_H, 0);
+    const rowTop = y - 1;
+    const rowH = labelRowHeight(rowTop);
+    fill_rect(Math.round(cx - CELL_W / 2), rowTop, CELL_W, rowH, 0);
     const fitted = fitText(songPageDrawCtx, text, CELL_W - 2);
     if (inverted) {
         /* The pill hugs the text, so it can be WIDER than the cell -
@@ -3529,7 +3691,7 @@ function drawSlotLabel(slot, text, inverted) {
          * and fill_rect refused the write. Clamped to the panel. */
         const w = Math.min(text_width(fitted) + 4, SCREEN_WIDTH);
         const x = Math.max(0, Math.min(Math.round(cx - w / 2), SCREEN_WIDTH - w));
-        fill_rect(x, y - 1, w, LABEL_ROW_H, 1);
+        fill_rect(x, rowTop, w, rowH, 1);
     }
     centeredText(songPageDrawCtx, cx, y, fitted, inverted ? 0 : 1);
 }
@@ -4324,6 +4486,7 @@ globalThis.tick = function () {
         }
     }
     tickShiftHandover();
+    tickModuleConfig();
     tickM8Nudge();
     tickPadReassert();
     tickPadAnimation();
