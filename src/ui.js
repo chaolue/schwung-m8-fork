@@ -846,9 +846,23 @@ let padReassert = 0;
  *
  * Conditional on having heard nothing, so an M8 that is already
  * talking is left alone and nobody's screen moves. */
+/* RETRIED RATHER THAN TIMED. One attempt at a guessed delay has been
+ * wrong three times now - too early, too close together, or the M8 not
+ * yet willing to act on input - and each guess costs a round trip to
+ * find out. So the module tries, waits to see whether the M8 answered,
+ * and tries again if it did not. Three attempts spread over about
+ * eight seconds covers a wide range of "not ready yet" without
+ * anyone having to know which one it was.
+ *
+ * The gap between the two presses is a second, not a third of one: the
+ * M8 has to finish painting the Note screen before the press that
+ * takes it back to Session means anything. */
 const M8_NUDGE_TICKS = 60;
-const M8_NUDGE_GAP_TICKS = 15;
+const M8_NUDGE_GAP_TICKS = 45;
+const M8_NUDGE_SETTLE_TICKS = 90;
+const M8_NUDGE_ATTEMPTS = 3;
 const M8_PAINTED_ENOUGH = 16;
+let m8NudgeAttempts = 0;
 const LPP_SESSION_NOTE = 93;
 const LPP_NOTE_SCREEN_NOTE = 94;
 let m8NudgeStage = 0;
@@ -862,6 +876,7 @@ function pressOnM8(lppNote) {
 
 function armM8Nudge() {
     ledsSeenSinceConnect = 0;
+    m8NudgeAttempts = 0;
     m8NudgeStage = 1;
     m8NudgeTicks = M8_NUDGE_TICKS;
 }
@@ -869,19 +884,42 @@ function armM8Nudge() {
 function tickM8Nudge() {
     if (!m8NudgeStage) return;
     if (--m8NudgeTicks > 0) return;
+
     if (m8NudgeStage === 1) {
         /* A handful of messages is not a repaint. The M8 paints its
          * grid in dozens - the first connect of a session traces at
          * around sixty - so anything under this is housekeeping and
          * the screen still needs asking for. */
-        if (ledsSeenSinceConnect >= M8_PAINTED_ENOUGH) { m8NudgeStage = 0; return; }
+        if (ledsSeenSinceConnect >= M8_PAINTED_ENOUGH) {
+            traceWrite(`  nudge: M8 painted on its own (${ledsSeenSinceConnect} leds)`);
+            m8NudgeStage = 0;
+            return;
+        }
+        m8NudgeAttempts++;
+        traceWrite(`  nudge ${m8NudgeAttempts}: heard ${ledsSeenSinceConnect}, pressing Note`);
         pressOnM8(LPP_NOTE_SCREEN_NOTE);
         m8NudgeStage = 2;
         m8NudgeTicks = M8_NUDGE_GAP_TICKS;
         return;
     }
-    pressOnM8(LPP_SESSION_NOTE);
-    m8NudgeStage = 0;
+
+    if (m8NudgeStage === 2) {
+        pressOnM8(LPP_SESSION_NOTE);
+        m8NudgeStage = 3;
+        m8NudgeTicks = M8_NUDGE_SETTLE_TICKS;
+        return;
+    }
+
+    /* Did it work? If the M8 answered, stop. If not, and there are
+     * attempts left, go round again - the failure is always "not yet",
+     * never "never". */
+    if (ledsSeenSinceConnect >= M8_PAINTED_ENOUGH || m8NudgeAttempts >= M8_NUDGE_ATTEMPTS) {
+        traceWrite(`  nudge: finished after ${m8NudgeAttempts}, heard ${ledsSeenSinceConnect} leds`);
+        m8NudgeStage = 0;
+        return;
+    }
+    m8NudgeStage = 1;
+    m8NudgeTicks = 1;
 }
 
 function tickPadReassert() {
