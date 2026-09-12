@@ -228,7 +228,53 @@ function renderKnobs(song) {
         if (free >= 0) grid.appendChild(renderAddTile(song, page, free));
         wrap.appendChild(grid);
     });
+
+    /* Every page full means there is nowhere for the tile above to go -
+     * and a song whose knob count is an exact multiple of eight hits
+     * that every time. A knob added here starts a page, which is what
+     * the module does on the device when a page fills up. */
+    if (!songHasFreeSlot(song)) {
+        wrap.appendChild(el("div", "pagehead", "Every page is full"));
+        var last = el("div", "grid");
+        last.appendChild(renderNewPageTile(song));
+        wrap.appendChild(last);
+    }
     return wrap;
+}
+
+function songHasFreeSlot(song) {
+    return (song.pages || []).some(function (page) { return firstFreeSlot(page) >= 0; });
+}
+
+function emptyPage() {
+    return { knobs: [null, null, null, null, null, null, null, null] };
+}
+
+function newKnob(song) {
+    return {
+        name: "KNB",
+        cc: nextFreeCc(song),
+        value: 64,
+        default: 64,
+        mode: 0,
+        display: 1
+    };
+}
+
+function renderNewPageTile(song) {
+    var box = el("div", "knob empty");
+    box.appendChild(el("div", "lock", "Page " + ((song.pages || []).length + 1)));
+    box.appendChild(button("+ Add knob on a new page",
+                           "Start another page of eight and put a knob on its first slot",
+                           false, function () {
+        var page = emptyPage();
+        page.knobs[0] = newKnob(song);
+        song.pages.push(page);
+        markDirty();
+        render();
+    }));
+    box.appendChild(el("div", "conn none", "no connection — set one on the Move"));
+    return box;
 }
 
 function firstFreeSlot(page) {
@@ -241,14 +287,7 @@ function renderAddTile(song, page, slot) {
     var box = el("div", "knob empty");
     box.appendChild(el("div", "lock", "Slot " + (slot + 1) + " is free"));
     box.appendChild(button("+ Add knob", "Put a knob on encoder " + (slot + 1), false, function () {
-        page.knobs[slot] = {
-            name: "KNB",
-            cc: nextFreeCc(song),
-            value: 64,
-            default: 64,
-            mode: 0,
-            display: 1
-        };
+        page.knobs[slot] = newKnob(song);
         markDirty();
         render();
     }));
@@ -444,11 +483,7 @@ function newSongId() {
 
 document.getElementById("add").addEventListener("click", function () {
     if (!doc) return;
-    doc.songs.push({
-        id: newSongId(),
-        name: "New Song",
-        pages: [{ knobs: [null, null, null, null, null, null, null, null] }]
-    });
+    doc.songs.push({ id: newSongId(), name: "New Song", pages: [emptyPage()] });
     markDirty();
     render();
 });
