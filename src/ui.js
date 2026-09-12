@@ -390,18 +390,6 @@ function controlMapMoveToLpp() {
     return viewMode === VIEW_TOP ? moveControlToLppNoteMapTop : moveControlToLppNoteMapBottom;
 }
 
-/* Wheel touch is a PEEK, and that is easy to lose sight of: touching
- * advances the view, releasing puts it back, and a CLICK while still
- * touching is what commits. With two views "put it back" and "advance"
- * were the same operation, so the original code just toggled twice and
- * nobody had to notice; with three they are different, and toggling
- * twice would skip a view instead of returning. Hence the remembered
- * view rather than a second cycle.
- *
- * Clicking again without releasing advances again, which is how the
- * third view is reached in one gesture. */
-let viewBeforePeek = VIEW_TOP;
-
 /* Which of M8's Launchpad screens is up, tracked from the button that
  * asked for it. M8 starts on the primary Session screen; Back returns to
  * it, Shift+Back reaches a SECOND session screen, Menu is Note and
@@ -429,13 +417,6 @@ function oddRowsAvailable() {
  * the pads on a layout the cycle no longer reaches. Both call this. */
 function reconcileOddRowsView() {
     if (oddRowsAvailable()) return;
-    /* The REMEMBERED view has to be cleaned up even when the current one
-     * is something else, because releasing the wheel restores it. Touch
-     * the wheel while on the odd view and the peek has already advanced
-     * past it, so odd survives only in viewBeforePeek - change screen in
-     * the middle of that gesture and letting go put the pads straight
-     * back on the view that had just been taken away. */
-    if (viewBeforePeek === VIEW_ODD) viewBeforePeek = VIEW_TOP;
     if (viewMode !== VIEW_ODD) return;
     viewMode = VIEW_TOP;
     queuePadRedraw();
@@ -617,7 +598,6 @@ let shiftHeld = false;
 let liveMode = false;
 let isPlaying = false;
 let currentView = moveBACK;
-let wheelClicked = false;
 let sysexBuffer = [];
 const m8InitSysex = [0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7];
 let m8Connected = false;  /* Track if M8 has connected */
@@ -3834,24 +3814,16 @@ globalThis.onMidiMessageInternal = function (data) {
     if (isNote) {
         let moveNoteNumber = data[1];
 
-        /* Wheel touch: peek at the next view - see advanceViewMode. */
+        /* Wheel touch holds the AUDITION and nothing else now - which
+         * half of the grid is showing moved to the mode buttons. */
         if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
             jogWheelHeld = true;
-            viewBeforePeek = viewMode;
-            advanceViewMode();
             return;
         }
 
         if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
             jogWheelHeld = false;
             revertAuditionedKnobs();
-            if (!wheelClicked) {
-                /* Nothing committed it, so it was only a look. */
-                viewMode = viewBeforePeek;
-                queuePadRedraw();
-                updateMoveViewPulse();
-            }
-            wheelClicked = false;
             return;
         }
 
@@ -3912,11 +3884,31 @@ globalThis.onMidiMessageInternal = function (data) {
              * Back and turn the second Session screen back into the
              * first one without the M8 having moved. */
             if (data[2] === 127) {
-                if (moveControlNumber === moveBACK) {
-                    lpMode = shiftHeld ? LP_SESSION_ALT : LP_SESSION;
-                } else {
-                    lpMode = moveControlNumber === moveMENU ? LP_NOTE : LP_SEQ;
-                }
+                /* PRESSING THE MODE YOU ARE ALREADY IN SWITCHES HALVES.
+                 *
+                 * Back does it for Session - and for Beat Repeat, which
+                 * is a session screen and shares the button - Menu for
+                 * Note, Capture for Sequencer. Pressing a DIFFERENT
+                 * mode button changes mode instead and leaves the half
+                 * where it was, so each screen keeps the half you last
+                 * looked at.
+                 *
+                 * Tested BEFORE lpMode is updated, or every press would
+                 * look like the mode it just set. The button is still
+                 * forwarded to the M8 either way: what it means over
+                 * there is the M8's business, and pressing Session
+                 * while on Session is a no-op to it. */
+                const target = moveControlNumber === moveBACK
+                    ? (shiftHeld ? LP_SESSION_ALT : LP_SESSION)
+                    : moveControlNumber === moveMENU ? LP_NOTE : LP_SEQ;
+                /* A press that does not CHANGE the screen switches the
+                 * half instead. Comparing the screen the press selects
+                 * against the current one is what keeps Shift+Back out
+                 * of it: that is a move to Beat Repeat, not a second
+                 * press of the screen you are on, even though it shares
+                 * the button with Session. */
+                if (target === lpMode) advanceViewMode();
+                lpMode = target;
                 reconcileOddRowsView();
                 traceScreen(moveControlNumber === moveBACK
                     ? (shiftHeld ? "Session 2 (Shift+Back)" : "Session (Back)")
@@ -3946,11 +3938,7 @@ globalThis.onMidiMessageInternal = function (data) {
                 openSettings();
                 return;
             }
-            /* Committing the peek. Advancing as well is what makes the
-             * third view reachable in one gesture rather than needing a
-             * touch-and-click per step. */
-            if (wheelClicked) advanceViewMode();
-            wheelClicked = true;
+            /* Unclaimed: switching halves moved to the mode buttons. */
             return;
         }
 
