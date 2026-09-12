@@ -369,6 +369,9 @@ let traceOn = false;
 let tracePending = [];
 let traceFramesLeft = 0;
 let traceLit = null;
+/* Every LED message of the window, in order, as [note, channel, colour]. */
+let traceEvents = [];
+const TRACE_EVENT_CAP = 600;
 let traceLabel = "";
 
 function traceWrite(line) {
@@ -398,31 +401,70 @@ function traceScreen(label) {
     traceReport();
     traceLabel = label;
     traceLit = new Map();
+    traceEvents = [];
     traceFramesLeft = TRACE_FRAMES;
     traceWrite(`--- ${label} (view ${viewMode}, oddAvailable ${oddRowsAvailable()})`);
 }
 
-function traceLed(lppNote, velocity, on) {
+/* `status` carries the CHANNEL, which is where a Launchpad puts the
+ * animation: 1 static, 2 blinking, 3 pulsing. Recording it alongside the
+ * colour is the whole point of the trace - "the cursor is white and does
+ * not blink" has two possible causes (the M8 never sent blue-on-channel-2,
+ * or it did and something later overwrote it with white-on-channel-1) and
+ * only the ORDER of the messages tells them apart. */
+function traceLed(lppNote, velocity, on, status) {
     if (!traceOn || !traceLit) return;
-    if (on && velocity > 0) traceLit.set(lppNote, velocity);
+    /* Recorded as the MIDI channel a person counts - 1, 2, 3 - not the
+     * status nibble, so the log reads the same way the Launchpad
+     * documentation does. */
+    const ch = (status & 0x0F) + 1;
+    if (on && velocity > 0) traceLit.set(lppNote, [velocity, ch]);
     else traceLit.delete(lppNote);
+    if (traceEvents.length < TRACE_EVENT_CAP) traceEvents.push([lppNote, ch, velocity]);
 }
 
 /* The lit set as an 8x8 picture, rows 8 (top) down to 1, so it can be
  * compared with the M8's screen directly. A digit is a lit pad. */
 function traceReport() {
     if (!traceOn || !traceLit) return;
-    const rows = [];
+    /* The grid, with the ANIMATION as the glyph: a static pad is #, a
+     * blinking one B, a pulsing one P. That alone answers whether the
+     * cursor is being sent animated at all. */
+    const glyph = (v) => (!v ? "." : v[1] === 2 ? "B" : v[1] === 3 ? "P" : "#");
+    traceWrite(`  lit under "${traceLabel}": ${traceLit.size} pads   (# static, B blink, P pulse)`);
     for (let r = 8; r >= 1; r--) {
         let line = `  row ${r}: `;
-        for (let c = 1; c <= 8; c++) line += traceLit.has(r * 10 + c) ? "#" : ".";
-        rows.push(line);
+        for (let c = 1; c <= 8; c++) line += glyph(traceLit.get(r * 10 + c));
+        traceWrite(line);
     }
+    /* Every distinct colour on screen, so an unmapped one is visible as a
+     * number we do not translate. */
+    const colours = new Map();
+    for (const [note, v] of traceLit) {
+        const key = `${v[0]}${v[1] === 1 ? "" : v[1] === 2 ? " blink" : " pulse"}`;
+        colours.set(key, (colours.get(key) || 0) + 1);
+    }
+    traceWrite("  colours: " + [...colours].map(([k, n]) => `${k} x${n}`).join(", "));
     const edge = [...traceLit.keys()].filter((n) => n < 11 || n > 88 || n % 10 === 0 || n % 10 === 9);
-    traceWrite(`  lit under "${traceLabel}": ${traceLit.size} pads`);
-    for (const r of rows) traceWrite(r);
     traceWrite(`  edge/control notes lit: ${JSON.stringify(edge.sort((a, b) => a - b))}`);
+
+    /* Any pad the M8 sent animated at ANY point, with its whole message
+     * history. A pad that was sent blinking and is now static was
+     * overwritten, and this is where that shows up. */
+    const everAnimated = new Set(traceEvents.filter((e) => e[1] !== 1).map((e) => e[0]));
+    if (everAnimated.size) {
+        traceWrite(`  pads sent animated: ${JSON.stringify([...everAnimated].sort((a, b) => a - b))}`);
+        for (const note of everAnimated) {
+            const hist = traceEvents.filter((e) => e[0] === note)
+                .map((e) => `ch${e[1]}:${e[2]}`).join(" -> ");
+            traceWrite(`    note ${note}: ${hist}`);
+        }
+    } else {
+        traceWrite("  pads sent animated: NONE - every message was channel 1");
+    }
+    traceWrite(`  (${traceEvents.length} led messages${traceEvents.length >= TRACE_EVENT_CAP ? ", capped" : ""})`);
     traceLit = null;
+    traceEvents = [];
     traceFlush();
 }
 
@@ -3371,7 +3413,7 @@ globalThis.onMidiMessageExternal = function (data) {
     markM8Connected();
 
     lppNoteValueMap.set(data[1], [...data]);
-    traceLed(data[1], data[2], noteOn);
+    traceLed(data[1], data[2], noteOn, value);
     applyLppLed(data[1], data[2], maskedValue, value);
 };
 
