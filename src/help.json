@@ -72,6 +72,22 @@
             "Session, and the",
             "third view with it.",
             "",
+            "Session: Shift+pad",
+            " stops that chain.",
+            "",
+            "Sequencer, holding a",
+            " pad with a note: the",
+            " track buttons set",
+            " its VELOCITY (four",
+            " of the eight levels",
+            " at a time - switch",
+            " halves for the rest).",
+            "",
+            "Sequencer, holding a",
+            " pad with a phrase:",
+            " Up/Down TRANSPOSE",
+            " it.",
+            "",
             "Colors from M8 are",
             "translated to Move",
             "LED colors in real",
@@ -83,8 +99,7 @@
             "knob while holding",
             "and it goes back to",
             "where it was when",
-            "you let go.",
-            "when you let go."
+            "you let go."
           ]
         },
         {
@@ -125,7 +140,13 @@
             "",
             "All of these are",
             "global, not per",
-            "song."
+            "song.",
+            "",
+            "Exit Module: leaves",
+            " the module, the same",
+            " as the Shift+Volume",
+            " +Jog-click the host's",
+            " own exit uses."
           ]
         },
         {
@@ -224,8 +245,7 @@
             "",
             "Jog Click on an",
             " EMPTY slot: Add",
-            " Knob wizard.",
-            " and Remove."
+            " Knob wizard."
           ]
         },
         {

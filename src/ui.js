@@ -2208,9 +2208,11 @@ function getActivePage() {
  * rather than two.
  * ============================================================================ */
 
+/* "songs" and "exit" are ACTION rows: they fire on click and never enter
+ * edit mode, the same shape Knob Settings uses for Add/Remove. */
 const SETTINGS_ROWS = [
     "songs", "knobChannel", "masterCc", "masterChannel", "masterMode",
-    "oddRows",
+    "oddRows", "exit",
 ];
 const SETTINGS_LABELS = {
     songs: "Songs",
@@ -2219,6 +2221,7 @@ const SETTINGS_LABELS = {
     masterChannel: "Mstr Chan",
     masterMode: "Mstr Mode",
     oddRows: "Odd Rows",
+    exit: "Exit Module",
 };
 const ONOFF_OPTIONS = ["Off", "On"];
 
@@ -2249,6 +2252,8 @@ function settingsRowValue(row) {
         case "masterCc": return String(settings.masterCc);
         case "masterMode": return KNOB_MODE_OPTIONS[settings.masterMode];
         case "oddRows": return ONOFF_OPTIONS[settings.oddRows ? 1 : 0];
+        /* An action row has nothing to show in the value column. */
+        case "exit": return "";
         default: return "";
     }
 }
@@ -2276,6 +2281,17 @@ function adjustSetting(row, step) {
             return;
     }
     markSongsDirty();
+}
+
+/* Leave the module the same way the host's own Shift+Vol+Jog-click does.
+ * The host runs onUnload for us on the way out, which is what persists the
+ * songs, but flushing first keeps the write on this side of the door in
+ * case a host build ever exits without the callback. */
+function exitModule() {
+    closeSettings();
+    flushSongsIfDirty();
+    if (typeof host_exit_module === "function") host_exit_module();
+    else if (typeof host_return_to_menu === "function") host_return_to_menu();
 }
 
 function handleSettingsInput(data) {
@@ -2315,6 +2331,10 @@ function handleSettingsInput(data) {
     if (row === "songs") {
         settingsOpen = false;
         openSongManagement();
+        return;
+    }
+    if (row === "exit") {
+        exitModule();
         return;
     }
     settingsEntered = !settingsEntered;
