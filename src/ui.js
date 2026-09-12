@@ -894,8 +894,14 @@ let padReassert = 0;
  * anyone having to know which one it was.
  *
  * The gap between the two presses is a second, not a third of one: the
- * M8 has to finish painting the Note screen before the press that
- * takes it back to Session means anything. */
+ * M8 has to finish painting the other screen before the press that
+ * takes it back to Session means anything.
+ *
+ * The screen it goes out to is the SEQUENCER, not Note. Both work -
+ * any screen change repaints the grid - but the sequencer is the
+ * better one to be caught on for the moment it takes: it is a phrase
+ * and a keyboard rather than a bare keyboard, so a nudge that fails
+ * to come back leaves you somewhere more useful. */
 const M8_NUDGE_TICKS = 60;
 const M8_NUDGE_GAP_TICKS = 45;
 const M8_NUDGE_SETTLE_TICKS = 90;
@@ -903,7 +909,7 @@ const M8_NUDGE_ATTEMPTS = 3;
 const M8_PAINTED_ENOUGH = 16;
 let m8NudgeAttempts = 0;
 const LPP_SESSION_NOTE = 93;
-const LPP_NOTE_SCREEN_NOTE = 94;
+const LPP_SEQ_SCREEN_NOTE = 97;
 let m8NudgeStage = 0;
 let m8NudgeTicks = 0;
 let ledsSeenSinceConnect = 0;
@@ -935,8 +941,8 @@ function tickM8Nudge() {
             return;
         }
         m8NudgeAttempts++;
-        traceWrite(`  nudge ${m8NudgeAttempts}: heard ${ledsSeenSinceConnect}, pressing Note`);
-        pressOnM8(LPP_NOTE_SCREEN_NOTE);
+        traceWrite(`  nudge ${m8NudgeAttempts}: heard ${ledsSeenSinceConnect}, pressing Sequencer`);
+        pressOnM8(LPP_SEQ_SCREEN_NOTE);
         m8NudgeStage = 2;
         m8NudgeTicks = M8_NUDGE_GAP_TICKS;
         return;
@@ -3906,13 +3912,48 @@ globalThis.onMidiMessageExternal = function (data) {
  * left waiting. Rare while a redraw only followed a wheel-touch; routine
  * once a screen change could start one, because that is exactly when the
  * M8 is talking most. */
+/* SHIFT HAS TO BE LET GO ON THE M8 WHEN A SCREEN TAKES OVER.
+ *
+ * Shift+Jog-click opens Settings, and the Shift PRESS was forwarded to
+ * the M8 a moment before that happened. The screen then swallows every
+ * button, the matching RELEASE among them, so the M8 is left holding a
+ * key nobody is pressing: everything after that reads as Shift+whatever
+ * until Shift is tapped again. The same is true of every screen that
+ * owns the surface, not just Settings.
+ *
+ * So the M8 is told Shift is up as a screen takes over, and told it is
+ * down again on the way back out if it really is still held. Driven
+ * from the tick by comparing against the last frame rather than hooked
+ * into each open/close, so a screen added later cannot forget it. */
+function screenOwnsSurface() {
+    return songMgmtOpen || settingsOpen || knobEditOpen || knobWizardOpen;
+}
+
+let surfaceOwnedLastTick = false;
+
+function sendShiftToM8(down) {
+    /* Shift is LPP 90 in every view, but ask the map rather than
+     * writing the number down twice. */
+    const lppNote = controlMapMoveToLpp().get(moveSHIFT);
+    if (lppNote === undefined) return;
+    if (down) move_midi_external_send([2 << 4 | 0x9, 0x90, lppNote, 100]);
+    else move_midi_external_send([2 << 4 | 0x8, 0x80, lppNote, 0]);
+}
+
+function tickShiftHandover() {
+    const owned = screenOwnsSurface();
+    if (owned === surfaceOwnedLastTick) return;
+    surfaceOwnedLastTick = owned;
+    if (shiftHeld) sendShiftToM8(!owned);
+}
+
 function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     /* Song Management, Knob Settings and the Add Knob wizard all own the
      * pads/buttons while open (text_entry.mjs reuses the pad grid for
      * typing) - keep tracking M8's state above so a resync (queuePadRedraw,
      * on close) can catch the pads up, but don't paint over whatever screen
      * is currently showing. */
-    if (songMgmtOpen || settingsOpen || knobEditOpen || knobWizardOpen) return;
+    if (screenOwnsSurface()) return;
 
     let activeLppToMovePadMap = padMapLppToMove();
     let moveNoteNumber = activeLppToMovePadMap.get(lppNoteNumber);
@@ -4255,6 +4296,7 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
+    tickShiftHandover();
     tickM8Nudge();
     tickPadReassert();
     tickPadAnimation();
