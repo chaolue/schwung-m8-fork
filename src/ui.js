@@ -835,10 +835,20 @@ let padReassert = 0;
  * the module steps to Note and straight back to Session, which lands
  * where it started, having painted the whole grid on the way.
  *
- * Conditional on having heard NOTHING since connecting, so an M8 that
- * is already talking is left alone and nobody's screen moves. */
+ * ARMED FROM init(), NOT FROM markM8Connected. That is the whole
+ * reason this did nothing on a reopen: markM8Connected is only ever
+ * reached from the incoming-MIDI handler, and an M8 that already
+ * believes a Launchpad is attached sends no identity request and no
+ * grid - so with the M8 silent the module never considered itself
+ * connected, and neither the nudge nor the re-asserts were ever
+ * armed. Waiting for the device to speak cannot be the trigger for
+ * the code whose job is to make it speak.
+ *
+ * Conditional on having heard nothing, so an M8 that is already
+ * talking is left alone and nobody's screen moves. */
 const M8_NUDGE_TICKS = 60;
 const M8_NUDGE_GAP_TICKS = 15;
+const M8_PAINTED_ENOUGH = 16;
 const LPP_SESSION_NOTE = 93;
 const LPP_NOTE_SCREEN_NOTE = 94;
 let m8NudgeStage = 0;
@@ -850,13 +860,21 @@ function pressOnM8(lppNote) {
     move_midi_external_send([2 << 4 | 0x8, 0x80, lppNote, 0]);
 }
 
+function armM8Nudge() {
+    ledsSeenSinceConnect = 0;
+    m8NudgeStage = 1;
+    m8NudgeTicks = M8_NUDGE_TICKS;
+}
+
 function tickM8Nudge() {
     if (!m8NudgeStage) return;
     if (--m8NudgeTicks > 0) return;
     if (m8NudgeStage === 1) {
-        /* Still nothing after a second: the M8 thinks it is already
-         * talking to a Launchpad and will not start on its own. */
-        if (ledsSeenSinceConnect > 0) { m8NudgeStage = 0; return; }
+        /* A handful of messages is not a repaint. The M8 paints its
+         * grid in dozens - the first connect of a session traces at
+         * around sixty - so anything under this is housekeeping and
+         * the screen still needs asking for. */
+        if (ledsSeenSinceConnect >= M8_PAINTED_ENOUGH) { m8NudgeStage = 0; return; }
         pressOnM8(LPP_NOTE_SCREEN_NOTE);
         m8NudgeStage = 2;
         m8NudgeTicks = M8_NUDGE_GAP_TICKS;
@@ -882,6 +900,10 @@ function tickPadReassert() {
     reassertControlLeds();
     updateMoveViewPulse(true);
     updatePLAYLed(true);
+    /* The song-preset steps are the module's OWN leds, not the M8's,
+     * and the same clear takes them out. They have their own window
+     * too, but sweeping them here keeps the two in step. */
+    updateSongStepLeds(true);
 }
 
 /* Repaint every side button, and the logo, from what the M8 last said
@@ -943,9 +965,9 @@ function markM8Connected() {
     updateSongStepLeds(true);
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
     padReassert = PAD_REASSERT_TICKS;
-    ledsSeenSinceConnect = 0;
-    m8NudgeStage = 1;
-    m8NudgeTicks = M8_NUDGE_TICKS;
+    /* Re-armed on a real connect too: this is the ordinary path, where
+     * the M8 has just told us it is there and the grid follows. */
+    armM8Nudge();
 }
 
 function initLPP() {
@@ -3952,6 +3974,13 @@ globalThis.init = function () {
      * feature does not work" rather than as "the flag did not take",
      * which cost a diagnostic round trip. */
     traceOn = std.loadFile(tracePath("trace_on")) != null;
+
+    /* Armed here rather than on connect - see armM8Nudge. On a reopen
+     * the M8 says nothing at all, so anything waiting to be triggered
+     * by the M8 waits forever. */
+    armM8Nudge();
+    padReassert = PAD_REASSERT_TICKS;
+    songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
 
     /* Proactively send LPP identity on startup - this handles the case where
      * M8 sent its identity request before the module loaded. The M8 will
