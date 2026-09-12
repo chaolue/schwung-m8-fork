@@ -3603,6 +3603,16 @@ globalThis.onMidiMessageInternal = function (data) {
             updateMoveViewPulse();
         }
 
+        /* Rec toggles session-EDIT, which is where the blinking blue
+         * cursor lives. It is not a screen as far as odd rows is
+         * concerned - it is still session - so it does not touch
+         * lpMode, but it is very much a different screen to look at,
+         * and the first trace of this missed it entirely for that
+         * reason. */
+        if (moveControlNumber === moveREC && data[2] === 127) {
+            traceScreen("Session EDIT (Rec)");
+        }
+
         /* Note: Shift+Wheel exit is handled at host level */
 
         /* Wheel click. Shift+click opens Settings, of which the song list
