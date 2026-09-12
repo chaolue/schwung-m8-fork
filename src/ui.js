@@ -170,10 +170,13 @@ const RGB_WHITE = 120;         /* #FFFFFF */
  * lit, technically. The edge buttons carry it, and that is most of why
  * they could not be seen. */
 const chrome_dim = 123;        /* #404040 - visible in a lit room */
-const green = 0x7e;
+/* In the 1-26 range, where each colour has a dim and a dark partner -
+ * see dimPartnerOf. 0x7e was #00FF00, a pure primary outside that
+ * range and so with nothing to pulse against. */
+const green = 10;              /* #79FF18 dull green */
 const navy = 0x7d;
 const sky = 0x5f;
-const red = 0x7f;
+const red = 1;                 /* #FF4032 bright red */
 /* THE CURSOR AND THE TRACK BUTTONS ARE BOTH THIS COLOUR (LPP 78), which
  * is why one value answered two separate reports: a pulsing edit-mode
  * cursor that looked white and static beside the white chain pads, and
@@ -246,6 +249,20 @@ const LPP_PAD_ANIMATION = {
 
 /* Move notes currently carrying an animation. */
 const animatedPads = new Set();
+
+/* The palette's 26 saturated colours each come with a DIM and a DARK
+ * partner, laid out regularly: dim = 63 + 2c, dark = 64 + 2c. Pulsing a
+ * colour against its own dim partner is what a Launchpad does - the pad
+ * breathes in its own hue - where pulsing against the pad's existing
+ * colour reads as two pads taking turns.
+ *
+ * Greys are not in that range and have no partner, so they fall back to
+ * the darkest grey; anything else falls back to black. */
+const DIM_PARTNER_GREY = { 118: 119, 120: 119, 121: 119, 122: 119, 123: 124 };
+function dimPartnerOf(colour) {
+    if (colour >= 1 && colour <= 26) return 63 + 2 * colour;
+    return DIM_PARTNER_GREY[colour] !== undefined ? DIM_PARTNER_GREY[colour] : black;
+}
 
 /* Take every animation back off. Called before a full repaint, which is
  * what makes a view change safe: the pads are about to show DIFFERENT
@@ -3489,9 +3506,17 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
              * the chain already was (white for a used chain, dark pink
              * for an empty one) and never in blue.
              *
-             * Putting it here instead leaves M8's repaints to the base
-             * where they belong, and the pad alternates between that and
-             * the cursor colour. */
+             * Putting the colour here instead survives those repaints.
+             * The base is written too, but to the colour's own DIM
+             * partner rather than to the colour - so if M8 leaves it
+             * alone the pad breathes blue, and if M8 repaints it the
+             * worst case is the previous behaviour rather than a lost
+             * cursor. */
+            /* BOTH slots, from the one colour: the dim partner
+             * underneath and the colour itself on top, so the pad
+             * breathes in its own hue instead of alternating with
+             * whatever the chain happened to be. */
+            move_midi_internal_send([0x09, 0x90, moveNoteNumber, dimPartnerOf(moveVelocity)]);
             move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, moveVelocity]);
             animatedPads.add(moveNoteNumber);
             return;
