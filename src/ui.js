@@ -368,7 +368,13 @@ const TRACE_FRAMES = 130;          /* ~3 s at 44 Hz */
 let traceOn = false;
 let tracePending = [];
 let traceFramesLeft = 0;
-let traceLit = null;
+/* The WHOLE screen, maintained continuously rather than per window.
+ * It used to be cleared at the start of each window, so a window only
+ * ever showed what CHANGED during it - and since the M8 paints the grid
+ * once and then sends deltas, every window after the first looked
+ * nearly empty. That reads as "the M8 sent almost nothing", which is a
+ * conclusion about the device rather than about the instrument. */
+let traceLit = new Map();
 /* Every LED message of the window, in order, as [note, channel, colour]. */
 let traceEvents = [];
 const TRACE_EVENT_CAP = 600;
@@ -400,7 +406,6 @@ function traceScreen(label) {
     if (!traceOn) return;
     traceReport();
     traceLabel = label;
-    traceLit = new Map();
     traceEvents = [];
     traceFramesLeft = TRACE_FRAMES;
     traceWrite(`--- ${label} (view ${viewMode}, oddAvailable ${oddRowsAvailable()})`);
@@ -413,7 +418,7 @@ function traceScreen(label) {
  * or it did and something later overwrote it with white-on-channel-1) and
  * only the ORDER of the messages tells them apart. */
 function traceLed(lppNote, velocity, on, status) {
-    if (!traceOn || !traceLit) return;
+    if (!traceOn) return;
     /* Recorded as the MIDI channel a person counts - 1, 2, 3 - not the
      * status nibble, so the log reads the same way the Launchpad
      * documentation does. */
@@ -426,12 +431,12 @@ function traceLed(lppNote, velocity, on, status) {
 /* The lit set as an 8x8 picture, rows 8 (top) down to 1, so it can be
  * compared with the M8's screen directly. A digit is a lit pad. */
 function traceReport() {
-    if (!traceOn || !traceLit) return;
+    if (!traceOn || !traceLabel) return;
     /* The grid, with the ANIMATION as the glyph: a static pad is #, a
      * blinking one B, a pulsing one P. That alone answers whether the
      * cursor is being sent animated at all. */
     const glyph = (v) => (!v ? "." : v[1] === 2 ? "B" : v[1] === 3 ? "P" : "#");
-    traceWrite(`  lit under "${traceLabel}": ${traceLit.size} pads   (# static, B blink, P pulse)`);
+    traceWrite(`  screen after "${traceLabel}": ${traceLit.size} leds lit   (# static, B blink, P pulse)`);
     for (let r = 8; r >= 1; r--) {
         let line = `  row ${r}: `;
         for (let c = 1; c <= 8; c++) line += glyph(traceLit.get(r * 10 + c));
@@ -462,8 +467,8 @@ function traceReport() {
     } else {
         traceWrite("  pads sent animated: NONE - every message was channel 1");
     }
-    traceWrite(`  (${traceEvents.length} led messages${traceEvents.length >= TRACE_EVENT_CAP ? ", capped" : ""})`);
-    traceLit = null;
+    traceWrite(`  (${traceEvents.length} led messages in this window${traceEvents.length >= TRACE_EVENT_CAP ? ", capped" : ""})`);
+    traceLabel = "";
     traceEvents = [];
     traceFlush();
 }
