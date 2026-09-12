@@ -104,10 +104,11 @@ a couple of seconds.</p>
   <span id="status" class="status">Loading…</span>
 </div>
 
-<p class="note">A knob's <strong>connection</strong> — which M8 parameter it stands for — is
+<p class="note">Only slots that hold a knob are listed; each page ends with a tile for the
+next free one. A knob's <strong>connection</strong> — which M8 parameter it stands for — is
 chosen from the catalogue on the Move, and so is the picture a group of knobs draws. Both are
 shown here and carried through untouched. What this page edits is the name, the CC, the send
-mode and the value display, plus adding, removing and reordering.</p>
+mode and the value display, plus adding, removing and moving between slots.</p>
 
 <ol class="songs" id="list"></ol>
 
@@ -199,43 +200,65 @@ function groupOf(knob) {
     return knob && knob.viz && knob.viz.group ? knob.viz.group : null;
 }
 
+/* Only the slots that HOLD something are drawn. Eight dashed boxes per
+ * page is mostly empty space once a song has a spare page or two, and
+ * the empty ones carry nothing to read. Adding is one tile at the end
+ * of each page that has room, rather than one per hole.
+ *
+ * The slot NUMBER stays on every card, because it is not decoration:
+ * slot 3 is the third encoder under your hand. */
 function renderKnobs(song) {
     var wrap = el("div", "knobs");
     var dupes = duplicateCcs(song);
 
     (song.pages || []).forEach(function (page, pi) {
+        var knobs = page.knobs || [];
+        var filled = [];
+        for (var si = 0; si < SLOTS_PER_PAGE; si++) if (knobs[si]) filled.push(si);
+        var free = firstFreeSlot(page);
+
         wrap.appendChild(el("div", "pagehead",
-            "Page " + (pi + 1) + " of " + song.pages.length));
+            "Page " + (pi + 1) + " of " + song.pages.length +
+            (filled.length ? "" : " — empty")));
+
         var grid = el("div", "grid");
-        for (var si = 0; si < SLOTS_PER_PAGE; si++) {
+        filled.forEach(function (si) {
             grid.appendChild(renderSlot(song, page, pi, si, dupes));
-        }
+        });
+        if (free >= 0) grid.appendChild(renderAddTile(song, page, free));
         wrap.appendChild(grid);
     });
     return wrap;
 }
 
+function firstFreeSlot(page) {
+    var knobs = page.knobs || [];
+    for (var si = 0; si < SLOTS_PER_PAGE; si++) if (!knobs[si]) return si;
+    return -1;
+}
+
+function renderAddTile(song, page, slot) {
+    var box = el("div", "knob empty");
+    box.appendChild(el("div", "lock", "Slot " + (slot + 1) + " is free"));
+    box.appendChild(button("+ Add knob", "Put a knob on encoder " + (slot + 1), false, function () {
+        page.knobs[slot] = {
+            name: "KNB",
+            cc: nextFreeCc(song),
+            value: 64,
+            default: 64,
+            mode: 0,
+            display: 1
+        };
+        markDirty();
+        render();
+    }));
+    box.appendChild(el("div", "conn none", "no connection — set one on the Move"));
+    return box;
+}
+
+/* Always called with a knob: renderKnobs skips the empty slots. */
 function renderSlot(song, page, pi, si, dupes) {
-    var knob = (page.knobs || [])[si] || null;
-
-    if (!knob) {
-        var box = el("div", "knob empty");
-        box.appendChild(el("div", "lock", "Slot " + (si + 1) + " — empty"));
-        box.appendChild(button("+ Add knob", "Put a plain knob in this slot", false, function () {
-            page.knobs[si] = {
-                name: "KNB",
-                cc: nextFreeCc(song),
-                value: 64,
-                default: 64,
-                mode: 0,
-                display: 1
-            };
-            markDirty();
-            render();
-        }));
-        return box;
-    }
-
+    var knob = page.knobs[si];
     var card = el("div", "knob");
 
     var top = el("div", "top");
