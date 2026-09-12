@@ -247,29 +247,36 @@ const LPP_PAD_ANIMATION = {
 /* Move notes currently carrying an animation. */
 const animatedPads = new Set();
 
-/* Base colours waiting to be written on a LATER frame.
+/* Animation targets waiting for the frame AFTER their base colour.
  *
- * Arming a pulse takes two writes to the same note - the partner colour
- * as the base, the pulse colour on the animation channel - and sending
- * both in one frame only ever delivered the second. The pad kept
- * whatever the M8 had last painted it (white for a used chain, dark
- * pink for an empty one) and alternated THAT with the pulse colour,
- * through every version of this: against black, against the cursor
- * colour, and against a hand-picked partner. The partner was never
- * arriving.
+ * Move inherits Push 2's LED protocol, which is explicit about this
+ * (AbletonPush2MIDIDisplayInterface, "LED animation"):
  *
- * So the animation goes out now and the base follows on the next tick.
- * That order matters too: a channel-0 write does not stop a running
- * animation on Move, so the base can safely land second, where doing it
- * the other way round would be a race. */
-const pendingPadBase = new Map();
+ *   "The starting color of an animation is sent with a note on or
+ *    control change message on channel 0. The second color, the
+ *    transition type and duration of the animation are sent with a
+ *    note on or control change message on channel 1...15."
+ *
+ * So the base comes FIRST and the target second - an animation is a
+ * transition between the two. And they cannot share a frame: Move
+ * keeps only the last write per note per flush, so a base and a target
+ * sent together lose the base, leaving the pad transitioning from
+ * whatever the M8 had last painted it. That is what made the cursor
+ * pulse from white or dark pink no matter which base colour was
+ * chosen.
+ *
+ * The same document also says "transitions are stopped by setting a
+ * color on channel 0", which is why sending the base second - the
+ * previous attempt - stopped the animation outright and left solid
+ * colours. */
+const pendingPadAnim = new Map();
 
-function drainPendingPadBase() {
-    if (!pendingPadBase.size) return;
-    for (const [note, colour] of pendingPadBase) {
-        move_midi_internal_send([0x09, 0x90, note, colour]);
+function drainPendingPadAnim() {
+    if (!pendingPadAnim.size) return;
+    for (const [note, target] of pendingPadAnim) {
+        move_midi_internal_send([0x09, 0x90 | target[0], note, target[1]]);
     }
-    pendingPadBase.clear();
+    pendingPadAnim.clear();
 }
 
 /* What a pulsing pad alternates WITH: a near neighbour of the same hue
@@ -321,12 +328,12 @@ function pulsePartnerOf(colour) {
  * is not - it changes the colour and leaves the animation running. That
  * is also the whole of the "pads stuck flashing" this relay was
  * originally disabled over. */
+/* "Transitions are stopped by setting a color on channel 0" - so the
+ * disarm is one ordinary write, and any target still queued for this
+ * pad has to be dropped or it would restart the animation next frame. */
 function disarmPad(note, colour) {
-    /* Same one-write-per-frame rule: the animation slot now, the base
-     * on the next tick. Both end up the same colour, so the hardware
-     * alternates between two identical colours - invisible. */
-    move_midi_internal_send([0x09, 0x90 | Pulse2th, note, colour]);
-    pendingPadBase.set(note, colour);
+    pendingPadAnim.delete(note);
+    move_midi_internal_send([0x09, 0x90, note, colour]);
     animatedPads.delete(note);
 }
 
@@ -335,12 +342,7 @@ function disarmAnimatedPads() {
     animatedPads.clear();
 }
 
-/* A pad the M8 has just repainted statically has no pending base of its
- * own any more - whatever was queued describes an animation that is
- * over, and writing it a frame later would undo the repaint. */
-function cancelPendingPadBase(note) {
-    pendingPadBase.delete(note);
-}
+
 
 /* Launchpad colour -> Move palette index.
  *
@@ -3565,21 +3567,22 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
              * alone the pad breathes blue, and if M8 repaints it the
              * worst case is the previous behaviour rather than a lost
              * cursor. */
-            /* Both slots come from the one colour - the pulse partner
-             * underneath, the colour itself on top - but they cannot
-             * both go out now: see pendingPadBase. */
-            move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, moveVelocity]);
-            pendingPadBase.set(moveNoteNumber, pulsePartnerOf(moveVelocity));
+            /* Base now, target next frame - see pendingPadAnim. Both
+             * come from the one colour: the pad transitions between
+             * the colour's partner and the colour itself, so it
+             * breathes in its own hue. */
+            move_midi_internal_send([0x09, 0x90, moveNoteNumber, pulsePartnerOf(moveVelocity)]);
+            pendingPadAnim.set(moveNoteNumber, [anim, moveVelocity]);
             animatedPads.add(moveNoteNumber);
             return;
         }
-        cancelPendingPadBase(moveNoteNumber);
+        /* A channel-0 write IS the stop, so this one message both
+         * repaints the pad and ends any transition on it. The queued
+         * target has to go, though, or it would start a new one on the
+         * next frame. */
+        pendingPadAnim.delete(moveNoteNumber);
+        animatedPads.delete(moveNoteNumber);
         move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
-        /* A channel-0 write does NOT stop a running animation - it only
-         * changes the colour underneath it, which is exactly how the
-         * cursor came to pulse in the wrong colour. So a pad that was
-         * animated needs telling explicitly. */
-        if (animatedPads.has(moveNoteNumber)) disarmPad(moveNoteNumber, moveVelocity);
         return;
     }
 
@@ -3872,7 +3875,7 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
-    drainPendingPadBase();
+    drainPendingPadAnim();
     drainPadRedraw();
     tickSongStepLeds();
     drawUI();
