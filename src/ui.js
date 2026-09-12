@@ -247,6 +247,31 @@ const LPP_PAD_ANIMATION = {
 /* Move notes currently carrying an animation. */
 const animatedPads = new Set();
 
+/* Base colours waiting to be written on a LATER frame.
+ *
+ * Arming a pulse takes two writes to the same note - the partner colour
+ * as the base, the pulse colour on the animation channel - and sending
+ * both in one frame only ever delivered the second. The pad kept
+ * whatever the M8 had last painted it (white for a used chain, dark
+ * pink for an empty one) and alternated THAT with the pulse colour,
+ * through every version of this: against black, against the cursor
+ * colour, and against a hand-picked partner. The partner was never
+ * arriving.
+ *
+ * So the animation goes out now and the base follows on the next tick.
+ * That order matters too: a channel-0 write does not stop a running
+ * animation on Move, so the base can safely land second, where doing it
+ * the other way round would be a race. */
+const pendingPadBase = new Map();
+
+function drainPendingPadBase() {
+    if (!pendingPadBase.size) return;
+    for (const [note, colour] of pendingPadBase) {
+        move_midi_internal_send([0x09, 0x90, note, colour]);
+    }
+    pendingPadBase.clear();
+}
+
 /* What a pulsing pad alternates WITH: a near neighbour of the same hue
  * at a clearly different brightness, so the pad reads as one pad
  * breathing rather than as two pads taking turns.
@@ -297,14 +322,24 @@ function pulsePartnerOf(colour) {
  * is also the whole of the "pads stuck flashing" this relay was
  * originally disabled over. */
 function disarmPad(note, colour) {
-    move_midi_internal_send([0x09, 0x90, note, colour]);
+    /* Same one-write-per-frame rule: the animation slot now, the base
+     * on the next tick. Both end up the same colour, so the hardware
+     * alternates between two identical colours - invisible. */
     move_midi_internal_send([0x09, 0x90 | Pulse2th, note, colour]);
+    pendingPadBase.set(note, colour);
     animatedPads.delete(note);
 }
 
 function disarmAnimatedPads() {
     for (const note of [...animatedPads]) disarmPad(note, black);
     animatedPads.clear();
+}
+
+/* A pad the M8 has just repainted statically has no pending base of its
+ * own any more - whatever was queued describes an animation that is
+ * over, and writing it a frame later would undo the repaint. */
+function cancelPendingPadBase(note) {
+    pendingPadBase.delete(note);
 }
 
 /* Launchpad colour -> Move palette index.
@@ -3530,15 +3565,15 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
              * alone the pad breathes blue, and if M8 repaints it the
              * worst case is the previous behaviour rather than a lost
              * cursor. */
-            /* BOTH slots, from the one colour: the pulse partner
-             * underneath and the colour itself on top, so the pad
-             * breathes in its own hue instead of alternating with
-             * whatever the chain happened to be. */
-            move_midi_internal_send([0x09, 0x90, moveNoteNumber, pulsePartnerOf(moveVelocity)]);
+            /* Both slots come from the one colour - the pulse partner
+             * underneath, the colour itself on top - but they cannot
+             * both go out now: see pendingPadBase. */
             move_midi_internal_send([0x09, 0x90 | anim, moveNoteNumber, moveVelocity]);
+            pendingPadBase.set(moveNoteNumber, pulsePartnerOf(moveVelocity));
             animatedPads.add(moveNoteNumber);
             return;
         }
+        cancelPendingPadBase(moveNoteNumber);
         move_midi_internal_send([(maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
         /* A channel-0 write does NOT stop a running animation - it only
          * changes the colour underneath it, which is exactly how the
@@ -3837,6 +3872,7 @@ globalThis.tick = function () {
             sendLPPIdentity();
         }
     }
+    drainPendingPadBase();
     drainPadRedraw();
     tickSongStepLeds();
     drawUI();
