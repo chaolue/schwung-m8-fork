@@ -20,6 +20,11 @@ import {
     renderPage, centeredText, fitText, SCREEN_WIDTH, COLS
 } from '/data/UserData/schwung/shared/param_pages/render_page.mjs';
 import { resolveViz } from '/data/UserData/schwung/shared/param_pages/viz.mjs';
+/* The brightness ramp Schwung maintains for knob leds, used here as the
+ * Neutral sweep rather than copied. It skips DarkGrey (#1A1A1A), which
+ * is within 2% of DarkGrey2 (#141414) and costs a step of the ramp for
+ * nothing - see the comment above WHITE_LEVELS. */
+import { WHITE_LEVELS } from '/data/UserData/schwung/shared/param_pages/knob_leds.mjs';
 import {
     lfoShapeSample, filterGainAt
 } from '/data/UserData/schwung/shared/param_pages/viz_draw.mjs';
@@ -191,7 +196,10 @@ const RGB_PRESET_DIM = 6;      /* #491804 ochre */
 const KNOB_LED_CCS = [71, 72, 73, 74, 75, 76, 77, 78];
 const KNOB_LED_ANIM = 0x01;            /* Trans24th - see constants.mjs */
 const KNOB_SWEEPS = [
-    [0, 124, 123, 120],                /* Neutral: black through grey to white */
+    /* Neutral: dark to white, black first so the bottom of the travel
+     * really is off. The rest is Schwung's own WHITE_LEVELS - six stops
+     * where this list used to have four. */
+    [RGB_OFF].concat(WHITE_LEVELS),
     [104, 105, 20, 21, 23, 26, 25],    /* Synthwave */
     [124, 35, 23, 26, 25],             /* Rose */
     [33, 16, 15, 14, 11, 8, 3, 2],     /* Rainbow */
@@ -3004,17 +3012,45 @@ function drawSongMgmt() {
 let knobSelectOpen = false;
 let knobSelectIndex = 0;
 
+/* WHERE THE CURSOR WAS WHEN IT LAST WENT AWAY.
+ *
+ * Editing a knob is rarely one visit: you set the CC, look at the page,
+ * come back for the display, come back again for the clamp. Starting at
+ * the first filled slot every time meant walking back along the row on
+ * each return. So the position is remembered - but only for the page it
+ * was on. Turn to another page, or switch song, and the memory does not
+ * apply: the cursor opens on that page's first knob, which is where it
+ * would have opened before any of this. */
+let knobSelectLast = null;     /* { songId, page, index } */
+
+function rememberKnobSelect() {
+    const song = getActiveSong();
+    knobSelectLast = {
+        songId: song ? song.id : null,
+        page: activePageIndex,
+        index: knobSelectIndex,
+    };
+}
+
 function openKnobSelect() {
     knobSelectOpen = true;
+    const page = getActivePage();
+    const song = getActiveSong();
+    if (knobSelectLast
+        && knobSelectLast.songId === (song ? song.id : null)
+        && knobSelectLast.page === activePageIndex) {
+        knobSelectIndex = Math.max(0, Math.min(KNOBS_PER_PAGE - 1, knobSelectLast.index));
+        return;
+    }
     /* Start on the first slot that HAS something, so the common case -
      * one knob on the page - needs no scrolling at all. Falls back to
      * slot 0 on an empty page, which is then the Add Knob door. */
-    const page = getActivePage();
     const first = page ? page.knobs.findIndex((k) => k) : -1;
     knobSelectIndex = first >= 0 ? first : 0;
 }
 
 function closeKnobSelect() {
+    rememberKnobSelect();
     knobSelectOpen = false;
 }
 
