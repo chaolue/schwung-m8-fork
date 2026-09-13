@@ -2658,7 +2658,8 @@ function adjustSetting(row, step) {
     markSongsDirty();
 }
 
-/* Leave the module the same way the host's own Shift+Vol+Jog-click does.
+/* Leave the module the same way Schwung's own Shift+Step 13 does - the
+ * gesture that opens the Tools menu also leaves a running module.
  * The host runs onUnload for us on the way out, which is what persists the
  * songs, but flushing first keeps the write on this side of the door in
  * case a host build ever exits without the callback. */
@@ -4681,7 +4682,7 @@ globalThis.init = function () {
      * while the module is showing that same knob turn as an M8 parameter.
      * No matching call on exit: the host clears this automatically on any
      * overtake-mode change, and this module has no exit path of its own
-     * (Shift+Vol+Jog-Click is handled entirely at the host level). */
+     * (Shift+Step 13 is handled entirely at the host level). */
     if (typeof shadow_set_overtake_suppress_master_volume === 'function') {
         shadow_set_overtake_suppress_master_volume(1);
     }
@@ -4710,7 +4711,7 @@ globalThis.init = function () {
 };
 
 /* Called once on teardown, regardless of which mechanism triggered it (the
- * host-level Shift+Vol+Jog-Click escape included). Forces an immediate save
+ * host-level Shift+Step 13 escape included). Forces an immediate save
  * if a knob edit is still waiting on the autosave throttle - otherwise up to
  * SONGS_AUTOSAVE_INTERVAL_MS of edits could be lost on exit. */
 globalThis.onUnload = function () {
