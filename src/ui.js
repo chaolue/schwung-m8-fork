@@ -205,7 +205,11 @@ const KNOB_SWEEPS = [
     [33, 16, 15, 14, 11, 8, 3, 2],     /* Rainbow */
     null,                              /* Off */
 ];
-const KNOB_SWEEP_OPTIONS = ["Neutral", "Synth", "Rose", "Rainbw", "Off"];
+/* Four characters at most. These are drawn in a LIST's value column,
+ * which is what is left after the label - the same squeeze that turned
+ * "Absolute" into "Abs" beside "Mstr Mode". The web UI, which has room,
+ * spells them out. */
+const KNOB_SWEEP_OPTIONS = ["Grey", "Syn", "Rose", "Rain", "Off"];
 /* The same five as the web UI's settings-schema.json spells them. */
 const KNOB_SWEEP_KEYS = ["neutral", "synthwave", "rose", "rainbow", "off"];
 const KNOB_SWEEP_DEFAULT = 0;
@@ -3012,34 +3016,35 @@ function drawSongMgmt() {
 let knobSelectOpen = false;
 let knobSelectIndex = 0;
 
-/* WHERE THE CURSOR WAS WHEN IT LAST WENT AWAY.
+/* WHERE THE CURSOR WAS WHEN IT LAST WENT AWAY, PER PAGE.
  *
  * Editing a knob is rarely one visit: you set the CC, look at the page,
  * come back for the display, come back again for the clamp. Starting at
  * the first filled slot every time meant walking back along the row on
- * each return. So the position is remembered - but only for the page it
- * was on. Turn to another page, or switch song, and the memory does not
- * apply: the cursor opens on that page's first knob, which is where it
- * would have opened before any of this. */
-let knobSelectLast = null;     /* { songId, page, index } */
+ * each return.
+ *
+ * Kept per page of per song, so wandering off to another page and back
+ * does not cost the position on either - one remembered slot would have
+ * been spent by the visit. Keyed by song id so the same page number in
+ * a different song is a different question; forgotten when the module
+ * unloads, which is the right lifetime for a cursor. */
+const knobSelectLast = new Map();   /* `${songId}:${page}` -> slot */
+
+function knobSelectKey() {
+    const song = getActiveSong();
+    return `${song ? song.id : "-"}:${activePageIndex}`;
+}
 
 function rememberKnobSelect() {
-    const song = getActiveSong();
-    knobSelectLast = {
-        songId: song ? song.id : null,
-        page: activePageIndex,
-        index: knobSelectIndex,
-    };
+    knobSelectLast.set(knobSelectKey(), knobSelectIndex);
 }
 
 function openKnobSelect() {
     knobSelectOpen = true;
     const page = getActivePage();
-    const song = getActiveSong();
-    if (knobSelectLast
-        && knobSelectLast.songId === (song ? song.id : null)
-        && knobSelectLast.page === activePageIndex) {
-        knobSelectIndex = Math.max(0, Math.min(KNOBS_PER_PAGE - 1, knobSelectLast.index));
+    const seen = knobSelectLast.get(knobSelectKey());
+    if (seen !== undefined) {
+        knobSelectIndex = Math.max(0, Math.min(KNOBS_PER_PAGE - 1, seen));
         return;
     }
     /* Start on the first slot that HAS something, so the common case -
