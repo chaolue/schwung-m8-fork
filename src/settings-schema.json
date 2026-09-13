@@ -49,6 +49,27 @@
             "type": "bool",
             "default": false,
             "help": "Adds a third pad view on the M8's main Session screen showing every other row, so a whole phrase fits at half resolution."
+        },
+        {
+            "key": "knob_leds",
+            "label": "Knob LED Colours",
+            "type": "enum",
+            "options": [
+                "Neutral",
+                "Synthwave",
+                "Rose",
+                "Rainbow",
+                "Off"
+            ],
+            "values": [
+                "neutral",
+                "synthwave",
+                "rose",
+                "rainbow",
+                "off"
+            ],
+            "default": "neutral",
+            "help": "The colour sweep each knob's lit ring walks as its value moves, for every knob that does not name one of its own. The Main knob has no ring of its own and is not affected."
         }
     ]
 }

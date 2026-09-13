@@ -129,6 +129,7 @@ var UPLOAD_URL = "/files/upload";
 var MODES = ["Absolute", "Relative"];
 var DISPLAYS = ["0-127", "Hex", "0-1", "-1..1"];
 var MULTS = ["1/4x", "1/3x", "1/2x", "1x", "2x"];
+var SWEEPS = ["Neutral", "Synthwave", "Rose", "Rainbow", "Off"];
 var MULT_DEFAULT = 3;
 var SLOTS_PER_PAGE = 8;
 
@@ -433,6 +434,25 @@ function renderSlot(song, page, pi, si, dupes) {
         markDirty();
     });
     row3.appendChild(mult);
+
+    row3.appendChild(el("label", null, "LED"));
+    var led = document.createElement("select");
+    var ledFollow = document.createElement("option");
+    ledFollow.value = ""; ledFollow.textContent = "Song";
+    led.appendChild(ledFollow);
+    SWEEPS.forEach(function (label, i) {
+        var o = document.createElement("option");
+        o.value = String(i); o.textContent = label;
+        led.appendChild(o);
+    });
+    led.value = typeof knob.led === "number" ? String(knob.led) : "";
+    led.title = "Colour sweep for this knob's lit ring. Song follows the one in Settings.";
+    led.addEventListener("change", function () {
+        if (led.value === "") delete knob.led;
+        else knob.led = parseInt(led.value, 10);
+        markDirty();
+    });
+    row3.appendChild(led);
 
     row3.appendChild(el("label", null, fineHex(knob) ? "MIN/MAX HEX" : "MIN/MAX"));
     row3.appendChild(limitBox(knob, "min"));

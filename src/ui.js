@@ -176,6 +176,35 @@ const RGB_PRESET = 8;          /* #FFC516 bright yellow */
  * which is what ruled out the darker 80 (#211902). */
 const RGB_PRESET_DIM = 6;      /* #491804 ochre */
 
+/* ------------------------------------------------- the knobs' own leds
+ *
+ * Each of the eight knobs has a lit ring, addressed by the same CC the
+ * knob turns on (71-78) and written on the 24th-note TRANSITION channel
+ * so the colour slides rather than snapping. A sweep is a short list of
+ * palette entries walked by the knob's position: the bottom of the
+ * travel is the first entry, the top the last.
+ *
+ * These four lists came from the module's original virtual_knobs.mjs,
+ * which lit the rings before the knobs became song-shaped. Knob 9 is
+ * left alone - it is the master, it belongs to no song, and the old
+ * code had to borrow the Sample button's led to show it at all. */
+const KNOB_LED_CCS = [71, 72, 73, 74, 75, 76, 77, 78];
+const KNOB_LED_ANIM = 0x01;            /* Trans24th - see constants.mjs */
+const KNOB_SWEEPS = [
+    [0, 124, 123, 120],                /* Neutral: black through grey to white */
+    [104, 105, 20, 21, 23, 26, 25],    /* Synthwave */
+    [124, 35, 23, 26, 25],             /* Rose */
+    [33, 16, 15, 14, 11, 8, 3, 2],     /* Rainbow */
+    null,                              /* Off */
+];
+const KNOB_SWEEP_OPTIONS = ["Neutral", "Synth", "Rose", "Rainbw", "Off"];
+/* The same five as the web UI's settings-schema.json spells them. */
+const KNOB_SWEEP_KEYS = ["neutral", "synthwave", "rose", "rainbow", "off"];
+const KNOB_SWEEP_DEFAULT = 0;
+const KNOB_SWEEP_OFF = 4;
+/* A knob with no sweep of its own follows the song's - the row below 0. */
+const KNOB_SWEEP_FOLLOW = -1;
+
 /* Kept for the LPP colour map below, which addresses pads only. */
 /* Only the LPP colour map uses these two now, and only as MOVE PALETTE
  * indices - the led call sites take a level through ledFor() instead.
@@ -1054,6 +1083,7 @@ function markM8Connected() {
         traceScreen("Session (startup)");
     }
     updateSongStepLeds(true);
+    updateKnobLeds(true);
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
     padReassert = PAD_REASSERT_TICKS;
     /* Re-armed on a real connect too: this is the ordinary path, where
@@ -1162,6 +1192,46 @@ function knobMaxStep(knob) {
     return knobFineHex(knob) ? 255 : 127;
 }
 
+/* Which sweep a knob uses: its own if it names one, otherwise the
+ * song's. Absent is the usual case and stores nothing. */
+function knobSweepIndex(knob) {
+    const own = knob && knob.led;
+    if (typeof own === "number" && own >= 0 && own < KNOB_SWEEPS.length) return own;
+    const global = settings.knobLeds;
+    return typeof global === "number" && global >= 0 && global < KNOB_SWEEPS.length
+        ? global : KNOB_SWEEP_DEFAULT;
+}
+
+/* Where the knob stands, as a colour. The position is read against the
+ * knob's whole scale rather than its clamp, so a knob limited to the
+ * middle of its travel lights the middle of the sweep - the ring says
+ * where the value IS, not how far through its own leash it is. */
+function knobLedColour(knob) {
+    const sweep = KNOB_SWEEPS[knobSweepIndex(knob)];
+    if (!sweep) return RGB_OFF;
+    const top = knobMaxStep(knob) || 1;
+    const level = Math.max(0, Math.min(1, knob.value / top));
+    return sweep[Math.round(level * (sweep.length - 1))];
+}
+
+/* Last colour written per ring, so a steady page costs nothing. */
+const knobLedCache = new Map();
+
+function updateKnobLeds(force) {
+    const page = getActivePage();
+    for (let i = 0; i < KNOB_LED_CCS.length; i++) {
+        const knob = page ? page.knobs[i] : null;
+        /* An empty slot is dark: there is nothing under that knob. */
+        const colour = knob ? knobLedColour(knob) : RGB_OFF;
+        const cc = KNOB_LED_CCS[i];
+        if (!force && knobLedCache.get(cc) === colour) continue;
+        knobLedCache.set(cc, colour);
+        /* Channel 1 is the 24th-note transition, so the ring slides to
+         * the new colour instead of stepping. */
+        move_midi_internal_send([0x0B, 0xb0 | KNOB_LED_ANIM, cc, colour]);
+    }
+}
+
 /* Which MIDI channel this knob sends on. Absent means "the song's" -
  * settings.knobChannel, which is what every knob did before the row
  * existed and what all but a stray one still wants. A knob only carries
@@ -1258,6 +1328,9 @@ const DEFAULT_SETTINGS = {
     masterValue: 0,
     /* Adds a third stop to the wheel-touch view cycle - see ODD_ROWS. */
     oddRows: false,
+    /* Which colour sweep the knob rings use, for every knob that does
+     * not name one of its own. Index into KNOB_SWEEP_OPTIONS. */
+    knobLeds: KNOB_SWEEP_DEFAULT,
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
@@ -2392,6 +2465,7 @@ function settingsAsConfig() {
         master_channel: settings.masterChannel + 1,
         master_mode: settings.masterMode === KNOB_MODE_RELATIVE ? "relative" : "absolute",
         odd_rows: !!settings.oddRows,
+        knob_leds: KNOB_SWEEP_KEYS[settings.knobLeds] || KNOB_SWEEP_KEYS[KNOB_SWEEP_DEFAULT],
     };
 }
 
@@ -2420,6 +2494,10 @@ function applyConfig(cfg) {
         const mode = String(cfg.master_mode) === "relative"
             ? KNOB_MODE_RELATIVE : KNOB_MODE_ABSOLUTE;
         if (mode !== settings.masterMode) { settings.masterMode = mode; changed = true; }
+    }
+    if (cfg.knob_leds !== undefined) {
+        const idx = KNOB_SWEEP_KEYS.indexOf(String(cfg.knob_leds));
+        if (idx >= 0 && idx !== settings.knobLeds) { settings.knobLeds = idx; changed = true; }
     }
     if (cfg.odd_rows !== undefined) {
         const on = cfg.odd_rows === true || cfg.odd_rows === "true" || cfg.odd_rows === 1;
@@ -2587,7 +2665,7 @@ function getActivePage() {
  * edit mode, the same shape Knob Settings uses for Add/Remove. */
 const SETTINGS_ROWS = [
     "songs", "knobChannel", "masterCc", "masterChannel", "masterMode",
-    "oddRows", "exit",
+    "oddRows", "knobLeds", "exit",
 ];
 const SETTINGS_LABELS = {
     songs: "Songs",
@@ -2596,6 +2674,7 @@ const SETTINGS_LABELS = {
     masterChannel: "Mstr Chan",
     masterMode: "Mstr Mode",
     oddRows: "Odd Rows",
+    knobLeds: "Knob LED",
     exit: "Exit Module",
 };
 const ONOFF_OPTIONS = ["Off", "On"];
@@ -2627,6 +2706,7 @@ function settingsRowValue(row) {
         case "masterCc": return String(settings.masterCc);
         case "masterMode": return KNOB_MODE_OPTIONS[settings.masterMode];
         case "oddRows": return ONOFF_OPTIONS[settings.oddRows ? 1 : 0];
+        case "knobLeds": return KNOB_SWEEP_OPTIONS[settings.knobLeds];
         /* An action row has nothing to show in the value column. */
         case "exit": return "";
         default: return "";
@@ -2651,6 +2731,10 @@ function adjustSetting(row, step) {
         case "oddRows":
             settings.oddRows = step > 0;
             reconcileOddRowsView();
+            break;
+        case "knobLeds":
+            settings.knobLeds = clamp(settings.knobLeds + step, 0, KNOB_SWEEP_OPTIONS.length - 1);
+            updateKnobLeds(false);
             break;
         default:
             return;
@@ -2947,8 +3031,26 @@ function handleKnobSelectInput(data) {
     if (control === moveJogTurn) {
         const delta = decodeDelta(data[2]);
         if (delta === 0) return true;
-        knobSelectIndex = Math.max(0, Math.min(KNOBS_PER_PAGE - 1,
-                                               knobSelectIndex + Math.sign(delta)));
+        /* PAST THE END IS THE NEXT PAGE, not a wall. The cursor is how
+         * every knob is reached, and stopping at slot 8 made the pages
+         * past this one unreachable without first putting the cursor
+         * away, turning the wheel, and raising it again. Walking off
+         * one end arrives at the other end of the neighbouring page,
+         * which is where you were going. */
+        const dir = Math.sign(delta);
+        const song = getActiveSong();
+        const pages = song ? song.pages.length : 1;
+        let next = knobSelectIndex + dir;
+        if (next < 0) {
+            if (activePageIndex <= 0) return true;      /* first slot of the first page */
+            activePageIndex--;
+            next = KNOBS_PER_PAGE - 1;
+        } else if (next >= KNOBS_PER_PAGE) {
+            if (activePageIndex >= pages - 1) return true;
+            activePageIndex++;
+            next = 0;
+        }
+        knobSelectIndex = next;
         return true;
     }
 
@@ -3001,11 +3103,11 @@ function handleKnobSelectInput(data) {
  * to click even when this page is full. A second door to the wizard
  * from inside a screen about ONE knob only invited the question of
  * which knob it would land next to. */
-const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "chan", "mode", "display", "mult",
-                              "min", "max", "move", "remove"];
+const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "chan", "mode", "display", "led",
+                              "mult", "min", "max", "move", "remove"];
 const KNOB_SETTINGS_LABELS = {
     name: "Name", connect: "Connect", cc: "CC", chan: "Chan", mode: "Mode",
-    display: "Display", mult: "Speed", min: "Min", max: "Max",
+    display: "Display", led: "LED", mult: "Speed", min: "Min", max: "Max",
     move: "Slot", remove: "Remove Knob",
 };
 
@@ -3190,6 +3292,15 @@ function handleKnobEditInput(data) {
             const wasFine = knobFineHex(knob);
             knob.display = Math.max(0, Math.min(KNOB_DISPLAY_OPTIONS.length - 1, knob.display + Math.sign(delta)));
             rescaleKnobForDisplay(knob, wasFine);
+        } else if (field === "led") {
+            const now = typeof knob.led === "number" ? knob.led : KNOB_SWEEP_FOLLOW;
+            const next = Math.max(KNOB_SWEEP_FOLLOW,
+                                  Math.min(KNOB_SWEEPS.length - 1, now + Math.sign(delta)));
+            if (next === KNOB_SWEEP_FOLLOW) delete knob.led;
+            else knob.led = next;
+            /* Not forced: the cache repaints exactly the ring whose
+             * colour this actually changed, which is usually one. */
+            updateKnobLeds(false);
         } else if (field === "mult") {
             knob.mult = Math.max(0, Math.min(KNOB_MULT_OPTIONS.length - 1,
                                              knobMultIndex(knob) + Math.sign(delta)));
@@ -3276,6 +3387,12 @@ function drawKnobEdit() {
             }
             if (field === "mode") return KNOB_MODE_OPTIONS[knob.mode];
             if (field === "display") return KNOB_DISPLAY_OPTIONS[knob.display];
+            /* "Song" is the usual answer, and it follows Settings as
+             * it stands rather than a copy taken here. */
+            if (field === "led") {
+                return typeof knob.led === "number"
+                    ? KNOB_SWEEP_OPTIONS[knob.led] : "Song";
+            }
             if (field === "mult") return KNOB_MULT_OPTIONS[knobMultIndex(knob)];
             if (field === "min") return formatKnobLimit(knob, knobLow(knob));
             if (field === "max") return formatKnobLimit(knob, knobHigh(knob));
@@ -4744,6 +4861,7 @@ globalThis.tick = function () {
     tickPadAnimation();
     drainPadRedraw();
     tickSongStepLeds();
+    updateKnobLeds(false);
     drawUI();
     flushSongsIfDirty();
 };
