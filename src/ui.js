@@ -1162,6 +1162,15 @@ function knobMaxStep(knob) {
     return knobFineHex(knob) ? 255 : 127;
 }
 
+/* Which MIDI channel this knob sends on. Absent means "the song's" -
+ * settings.knobChannel, which is what every knob did before the row
+ * existed and what all but a stray one still wants. A knob only carries
+ * a channel of its own when it is pointed at something that is not the
+ * M8, or at a second M8 listening elsewhere. */
+function knobChannelOf(knob) {
+    return typeof knob.chan === "number" ? knob.chan : settings.knobChannel;
+}
+
 /* What goes on the wire: seven bits, whatever scale the knob counts in. */
 function knobCcValue(knob) {
     return knobFineHex(knob) ? (knob.value >> 1) : knob.value;
@@ -2981,20 +2990,26 @@ function handleKnobSelectInput(data) {
  * forwarding, resyncs the pads on close.
  * ============================================================================ */
 
-/* "add" and "remove" are ACTION rows, not values: they never enter edit
- * mode, they fire on click. Kept in the same list so the jog walks them
- * like any other row rather than needing a second gesture to reach.
+/* "remove" is an ACTION row, not a value: it never enters edit mode, it
+ * fires on click. Kept in the same list so the jog walks it like any
+ * other row rather than needing a second gesture to reach.
  *
- * "add" is here as well as on an empty slot because a FULL page has no
- * empty slot left to touch - that is the case auto-page-creation exists
- * for, and without a second door it would be unreachable. */
-const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "mode", "display", "mult",
-                              "min", "max", "move", "add", "remove"];
+ * No Add Knob row: adding is the jogwheel cursor's job, on an empty
+ * slot, and a song always carries a spare page - so there is somewhere
+ * to click even when this page is full. A second door to the wizard
+ * from inside a screen about ONE knob only invited the question of
+ * which knob it would land next to. */
+const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "chan", "mode", "display", "mult",
+                              "min", "max", "move", "remove"];
 const KNOB_SETTINGS_LABELS = {
-    name: "Name", connect: "Connect", cc: "CC", mode: "Mode", display: "Display",
-    mult: "Speed", min: "Min", max: "Max",
-    move: "Slot", add: "Add Knob", remove: "Remove Knob",
+    name: "Name", connect: "Connect", cc: "CC", chan: "Chan", mode: "Mode",
+    display: "Display", mult: "Speed", min: "Min", max: "Max",
+    move: "Slot", remove: "Remove Knob",
 };
+
+/* The channel row runs one below 1, and that stop is "follow the
+ * song's channel" rather than a channel of its own. */
+const KNOB_CHAN_FOLLOW = -1;
 
 /* Min and Max are ends of the travel, so they read in the knob's own
  * display - a hex knob's clamp is 30 to 4F, not 48 to 79. A shifted
@@ -3162,6 +3177,11 @@ function handleKnobEditInput(data) {
         const field = KNOB_SETTINGS_FIELDS[knobEditCursor];
         if (field === "cc") {
             knob.cc = Math.max(1, Math.min(127, knob.cc + Math.sign(delta)));
+        } else if (field === "chan") {
+            const now = typeof knob.chan === "number" ? knob.chan : KNOB_CHAN_FOLLOW;
+            const next = Math.max(KNOB_CHAN_FOLLOW, Math.min(15, now + Math.sign(delta)));
+            if (next === KNOB_CHAN_FOLLOW) delete knob.chan;
+            else knob.chan = next;
         } else if (field === "mode") {
             knob.mode = Math.max(0, Math.min(KNOB_MODE_OPTIONS.length - 1, knob.mode + Math.sign(delta)));
         } else if (field === "display") {
@@ -3205,15 +3225,6 @@ function handleKnobEditInput(data) {
             openKnobWizard(null, index);
             return;
         }
-        if (field === "add") {
-            closeKnobEdit();
-            /* No target: placement is worked out when the leaf is chosen,
-             * because only then is it known how many slots it needs.
-             * nextFreeKnobRun appends a page if there is no room, which is
-             * the "this page is full" path this row exists for. */
-            openKnobWizard(null);
-            return;
-        }
         if (field === "remove") {
             const song = getActiveSong();
             if (song) removeKnobAt(song, activePageIndex, knobEditIndex);
@@ -3254,6 +3265,13 @@ function drawKnobEdit() {
              * need the row. */
             if (field === "connect") return knob.detail ? shortLabel(knob.detail) : "-";
             if (field === "cc") return String(knob.cc);
+            /* "Song" is the usual answer: the channel from Settings,
+             * whatever that is now, rather than a copy of it taken when
+             * the knob was made. */
+            if (field === "chan") {
+                return typeof knob.chan === "number"
+                    ? String(knob.chan + 1) : `Song ${settings.knobChannel + 1}`;
+            }
             if (field === "mode") return KNOB_MODE_OPTIONS[knob.mode];
             if (field === "display") return KNOB_DISPLAY_OPTIONS[knob.display];
             if (field === "mult") return KNOB_MULT_OPTIONS[knobMultIndex(knob)];
@@ -3950,10 +3968,10 @@ function revertAuditionedKnobs() {
              * counts CC steps, so a hex knob's two bytes are one. */
             const ccDelta = knobFineHex(knob) ? Math.round(delta / 2) : delta;
             const size = Math.min(63, Math.abs(ccDelta));
-            if (size) move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
+            if (size) move_midi_external_send([2 << 4 | 0xb, 0xb0 | knobChannelOf(knob),
                                                knob.cc, ccDelta > 0 ? size : 64 + size]);
         } else {
-            move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
+            move_midi_external_send([2 << 4 | 0xb, 0xb0 | knobChannelOf(knob),
                                      knob.cc, knobCcValue(knob)]);
         }
     }
@@ -4190,7 +4208,7 @@ function handleSongKnobTurn(data) {
      * still tracks an approximate position for the on-screen display either
      * way, but isn't what's on the wire in this mode. */
     const wireValue = knob.mode === KNOB_MODE_RELATIVE ? data[2] : knobCcValue(knob);
-    move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel, knob.cc, wireValue]);
+    move_midi_external_send([2 << 4 | 0xb, 0xb0 | knobChannelOf(knob), knob.cc, wireValue]);
     markSongsDirty();
 }
 

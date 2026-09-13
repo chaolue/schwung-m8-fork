@@ -353,6 +353,27 @@ function renderSlot(song, page, pi, si, dupes) {
     cc.addEventListener("change", render);
     row.appendChild(cc);
 
+    /* Which channel this knob sends on. "Song" is the usual answer -
+     * the one in Settings - and a knob only carries its own when it is
+     * pointed at something that is not the M8. */
+    var chan = document.createElement("select");
+    var follow = document.createElement("option");
+    follow.value = ""; follow.textContent = "Ch: Song";
+    chan.appendChild(follow);
+    for (var c = 0; c < 16; c++) {
+        var co = document.createElement("option");
+        co.value = String(c); co.textContent = "Ch " + (c + 1);
+        chan.appendChild(co);
+    }
+    chan.value = typeof knob.chan === "number" ? String(knob.chan) : "";
+    chan.title = "MIDI channel. Song follows the one in Settings.";
+    chan.addEventListener("change", function () {
+        if (chan.value === "") delete knob.chan;
+        else knob.chan = parseInt(chan.value, 10);
+        markDirty();
+    });
+    row.appendChild(chan);
+
     var mode = document.createElement("select");
     MODES.forEach(function (label, i) {
         var o = document.createElement("option");
