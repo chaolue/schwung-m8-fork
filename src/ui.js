@@ -684,6 +684,15 @@ let initRetryTicks = 0;   /* Ticks since startup for retry logic */
 const INIT_RETRY_INTERVAL = 60;  /* Send init every ~1 second if not connected */
 
 function drawUI() {
+    if (mainKnobOpen) {
+        try {
+            drawMainKnob();
+            return;
+        } catch (e) {
+            console.log(`drawMainKnob: render failed: ${e}`);
+            closeMainKnob();
+        }
+    }
     if (settingsOpen && !songMgmtOpen) {
         try {
             drawSettings();
@@ -1180,6 +1189,9 @@ const KNOB_MODE_OPTIONS = ["Abs", "Rel"];
 const KNOB_MODE_ABSOLUTE = 0;
 const KNOB_MODE_RELATIVE = 1;
 const KNOB_DISPLAY_OPTIONS = ["0-127", "Hex", "0-1", "-1..1"];
+/* The same four as settings-schema.json spells them, for the main knob's
+ * row on the web settings page. */
+const MASTER_DISPLAY_KEYS = ["0-127", "hex", "0-1", "-1..1"];
 const KNOB_DISPLAY_HEX = 1;
 const KNOB_DISPLAY_UNIT = 2;
 const KNOB_DISPLAY_BIPOLAR = 3;
@@ -1332,6 +1344,9 @@ const DEFAULT_SETTINGS = {
     masterChannel: 3,
     masterCc: 79,
     masterMode: KNOB_MODE_ABSOLUTE,
+    /* How the panel over the page reads the main knob: 0-127, Hex,
+     * 0-1 or -1..1, the same four a song knob offers. */
+    masterDisplay: KNOB_DISPLAY_HEX,
     /* Where the master knob was left. Kept with the settings rather
      * than in a song because the knob belongs to no song, and kept at
      * all so the readout starts where you left it instead of at zero
@@ -2476,6 +2491,7 @@ function settingsAsConfig() {
         master_cc: settings.masterCc,
         master_channel: settings.masterChannel + 1,
         master_mode: settings.masterMode === KNOB_MODE_RELATIVE ? "relative" : "absolute",
+        master_display: MASTER_DISPLAY_KEYS[settings.masterDisplay] || MASTER_DISPLAY_KEYS[KNOB_DISPLAY_HEX],
         odd_rows: !!settings.oddRows,
         knob_leds: KNOB_SWEEP_KEYS[settings.knobLeds] || KNOB_SWEEP_KEYS[KNOB_SWEEP_DEFAULT],
     };
@@ -2506,6 +2522,10 @@ function applyConfig(cfg) {
         const mode = String(cfg.master_mode) === "relative"
             ? KNOB_MODE_RELATIVE : KNOB_MODE_ABSOLUTE;
         if (mode !== settings.masterMode) { settings.masterMode = mode; changed = true; }
+    }
+    if (cfg.master_display !== undefined) {
+        const idx = MASTER_DISPLAY_KEYS.indexOf(String(cfg.master_display));
+        if (idx >= 0 && idx !== settings.masterDisplay) { settings.masterDisplay = idx; changed = true; }
     }
     if (cfg.knob_leds !== undefined) {
         const idx = KNOB_SWEEP_KEYS.indexOf(String(cfg.knob_leds));
@@ -2675,16 +2695,20 @@ function getActivePage() {
 
 /* "songs" and "exit" are ACTION rows: they fire on click and never enter
  * edit mode, the same shape Knob Settings uses for Add/Remove. */
+/* "songs", "mainKnob" and "exit" are ACTION rows: they fire on click
+ * and never enter edit mode.
+ *
+ * The main knob's CC, channel, send mode and display used to sit here
+ * as four rows of the seven, which made a list mostly about ONE knob
+ * that is not even part of a song. They are a screen of their own now,
+ * behind Main Knob. */
 const SETTINGS_ROWS = [
-    "songs", "knobChannel", "masterCc", "masterChannel", "masterMode",
-    "oddRows", "knobLeds", "exit",
+    "songs", "knobChannel", "mainKnob", "oddRows", "knobLeds", "exit",
 ];
 const SETTINGS_LABELS = {
     songs: "Songs",
     knobChannel: "Knob Chan",
-    masterCc: "Master CC",
-    masterChannel: "Mstr Chan",
-    masterMode: "Mstr Mode",
+    mainKnob: "Main Knob",
     oddRows: "Odd Rows",
     knobLeds: "Knob LED",
     exit: "Exit Module",
@@ -2714,9 +2738,9 @@ function settingsRowValue(row) {
         /* Channels are stored 0-15 on the wire and shown 1-16, which is
          * how M8 (and everything else) numbers them. */
         case "knobChannel": return String(settings.knobChannel + 1);
-        case "masterChannel": return String(settings.masterChannel + 1);
-        case "masterCc": return String(settings.masterCc);
-        case "masterMode": return KNOB_MODE_OPTIONS[settings.masterMode];
+        /* The row is a door, and what is behind it is the knob's CC -
+         * the one thing you would look for from out here. */
+        case "mainKnob": return `CC ${settings.masterCc}`;
         case "oddRows": return ONOFF_OPTIONS[settings.oddRows ? 1 : 0];
         case "knobLeds": return KNOB_SWEEP_OPTIONS[settings.knobLeds];
         /* An action row has nothing to show in the value column. */
@@ -2730,15 +2754,6 @@ function adjustSetting(row, step) {
     switch (row) {
         case "knobChannel":
             settings.knobChannel = clamp(settings.knobChannel + step, 0, 15);
-            break;
-        case "masterChannel":
-            settings.masterChannel = clamp(settings.masterChannel + step, 0, 15);
-            break;
-        case "masterCc":
-            settings.masterCc = clamp(settings.masterCc + step, 0, 127);
-            break;
-        case "masterMode":
-            settings.masterMode = clamp(settings.masterMode + step, 0, KNOB_MODE_OPTIONS.length - 1);
             break;
         case "oddRows":
             settings.oddRows = step > 0;
@@ -2806,11 +2821,123 @@ function handleSettingsInput(data) {
         openSongManagement();
         return;
     }
+    if (row === "mainKnob") {
+        settingsOpen = false;
+        openMainKnob();
+        return;
+    }
     if (row === "exit") {
         exitModule();
         return;
     }
     settingsEntered = !settingsEntered;
+}
+
+/* ============================================================================
+ * Main Knob - Settings > Main Knob, Back returns there.
+ *
+ * Knob 9 is a pass-through that belongs to no song: its own CC, its own
+ * channel, its own send mode and now its own display. Four rows about
+ * one knob, off the main list rather than in it.
+ * ============================================================================ */
+
+const MAIN_KNOB_FIELDS = ["cc", "chan", "mode", "display"];
+const MAIN_KNOB_LABELS = { cc: "CC", chan: "Chan", mode: "Mode", display: "Display" };
+
+let mainKnobOpen = false;
+let mainKnobCursor = 0;
+let mainKnobEntered = false;
+
+function openMainKnob() {
+    mainKnobOpen = true;
+    mainKnobCursor = 0;
+    mainKnobEntered = false;
+}
+
+function closeMainKnob() {
+    mainKnobOpen = false;
+    /* Back up to where it was opened from, the same as the song list. */
+    settingsOpen = true;
+}
+
+function mainKnobRowValue(field) {
+    switch (field) {
+        case "cc": return String(settings.masterCc);
+        case "chan": return String(settings.masterChannel + 1);
+        case "mode": return KNOB_MODE_OPTIONS[settings.masterMode];
+        case "display": return KNOB_DISPLAY_OPTIONS[settings.masterDisplay];
+        default: return "";
+    }
+}
+
+function adjustMainKnob(field, step) {
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    switch (field) {
+        case "cc":
+            settings.masterCc = clamp(settings.masterCc + step, 0, 127);
+            break;
+        case "chan":
+            settings.masterChannel = clamp(settings.masterChannel + step, 0, 15);
+            break;
+        case "mode":
+            settings.masterMode = clamp(settings.masterMode + step, 0, KNOB_MODE_OPTIONS.length - 1);
+            break;
+        case "display":
+            settings.masterDisplay = clamp(settings.masterDisplay + step,
+                                           0, KNOB_DISPLAY_OPTIONS.length - 1);
+            break;
+        default:
+            return;
+    }
+    markSongsDirty();
+}
+
+function handleMainKnobInput(data) {
+    if (data[0] !== 0xb0) return;
+
+    const moveControlNumber = data[1];
+    const pressed = data[2] === 127;
+
+    if (moveControlNumber === moveSHIFT) {
+        shiftHeld = pressed;
+        return;
+    }
+
+    if (moveControlNumber === moveJogTurn) {
+        const delta = decodeDelta(data[2]);
+        if (delta === 0) return;
+        if (mainKnobEntered) {
+            adjustMainKnob(MAIN_KNOB_FIELDS[mainKnobCursor], Math.sign(delta));
+        } else {
+            mainKnobCursor = Math.max(0, Math.min(MAIN_KNOB_FIELDS.length - 1,
+                                                  mainKnobCursor + Math.sign(delta)));
+        }
+        return;
+    }
+
+    if (!pressed) return;
+
+    if (moveControlNumber === moveBACK) {
+        if (mainKnobEntered) { mainKnobEntered = false; return; }
+        closeMainKnob();
+        return;
+    }
+
+    if (moveControlNumber !== moveWHEEL) return;
+    mainKnobEntered = !mainKnobEntered;
+}
+
+function drawMainKnob() {
+    clear_screen();
+    drawMenuHeader("Main Knob");
+    drawMenuList({
+        items: MAIN_KNOB_FIELDS,
+        selectedIndex: mainKnobCursor,
+        editMode: mainKnobEntered,
+        getLabel: (field) => MAIN_KNOB_LABELS[field],
+        getValue: (field) => mainKnobRowValue(field),
+    });
+    drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Settings"]);
 }
 
 function drawSettings() {
@@ -3424,7 +3551,7 @@ function drawKnobEdit() {
              * the knob was made. */
             if (field === "chan") {
                 return typeof knob.chan === "number"
-                    ? String(knob.chan + 1) : `Song ${settings.knobChannel + 1}`;
+                    ? String(knob.chan + 1) : "Song";
             }
             if (field === "mode") return KNOB_MODE_OPTIONS[knob.mode];
             if (field === "display") return KNOB_DISPLAY_OPTIONS[knob.display];
@@ -4083,8 +4210,18 @@ function drawSlotLabel(slot, text, inverted) {
  * top of the dials instead of one of them. */
 const MASTER_OVERLAY_H = 17;
 
+/* The main knob's value in whatever Settings > Main Knob asks for.
+ * Borrows the song knobs' formatter rather than keeping a second set of
+ * rules: the master stores CC steps, and hex counts in bytes, so that
+ * one reading is doubled on the way in. */
+function formatMasterValue() {
+    const shown = { display: settings.masterDisplay, value: settings.masterValue };
+    if (knobFineHex(shown)) shown.value = Math.min(255, settings.masterValue * 2);
+    return formatKnobReadoutValue(shown);
+}
+
 function drawMasterOverlay() {
-    const label = "Main " + (settings.masterValue * 2).toString(16).toUpperCase().padStart(2, "0");
+    const label = "Main " + formatMasterValue();
     const w = Math.min(SCREEN_WIDTH - 8, text_width(label) + 18);
     const x = Math.round((SCREEN_WIDTH - w) / 2);
     const y = 24;
@@ -4504,7 +4641,7 @@ globalThis.onMidiMessageExternal = function (data) {
  * from the tick by comparing against the last frame rather than hooked
  * into each open/close, so a screen added later cannot forget it. */
 function screenOwnsSurface() {
-    return songMgmtOpen || settingsOpen || knobEditOpen || knobWizardOpen;
+    return songMgmtOpen || settingsOpen || mainKnobOpen || knobEditOpen || knobWizardOpen;
 }
 
 let surfaceOwnedLastTick = false;
@@ -4607,6 +4744,10 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
 globalThis.onMidiMessageInternal = function (data) {
     if (songMgmtOpen) {
         handleSongMgmtInput(data);
+        return;
+    }
+    if (mainKnobOpen) {
+        handleMainKnobInput(data);
         return;
     }
     if (settingsOpen) {

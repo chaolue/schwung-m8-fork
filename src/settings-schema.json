@@ -44,6 +44,25 @@
             "help": "Absolute sends the knob's position and is the only mode the M8 reads - its learn system takes the value as sent. Relative sends the movement instead, for other gear sharing the MIDI wire."
         },
         {
+            "key": "master_display",
+            "label": "Main Knob Value Display",
+            "type": "enum",
+            "options": [
+                "0-127",
+                "Hex",
+                "0-1",
+                "-1..1"
+            ],
+            "values": [
+                "0-127",
+                "hex",
+                "0-1",
+                "-1..1"
+            ],
+            "default": "hex",
+            "help": "How the Main knob's value reads in the panel that appears over the knob page while it is moving."
+        },
+        {
             "key": "odd_rows",
             "label": "Odd Rows View",
             "type": "bool",
