@@ -1142,6 +1142,95 @@ const KNOB_DISPLAY_HEX = 1;
 const KNOB_DISPLAY_UNIT = 2;
 const KNOB_DISPLAY_BIPOLAR = 3;
 
+/* ---------------------------------------------------- a knob's own scale
+ *
+ * A CC is seven bits and an M8 parameter is a byte, so a hex knob used to
+ * show its value doubled: every other byte, 00 02 04 ... FE, and the odd
+ * ones simply unreachable. A knob set to Hex now counts in BYTES - 0 to
+ * 255, every value there - and sends value >> 1 on the wire. The M8 still
+ * hears one CC per two bytes, which is all seven bits can carry; what
+ * changes is that the number under your hand is the one the M8's own
+ * screen shows, and you can land on any of them.
+ *
+ * Note-valued parameters (Tracking's low and high) are already 0-127 on
+ * the M8 itself, so they keep the 128-step scale - see M8_NOTE_SCALE. */
+function knobFineHex(knob) {
+    return knob.display === KNOB_DISPLAY_HEX && knob.scale !== M8_NOTE_SCALE;
+}
+
+function knobMaxStep(knob) {
+    return knobFineHex(knob) ? 255 : 127;
+}
+
+/* What goes on the wire: seven bits, whatever scale the knob counts in. */
+function knobCcValue(knob) {
+    return knobFineHex(knob) ? (knob.value >> 1) : knob.value;
+}
+
+/* The ends of the knob's travel. A knob with no clamp recorded runs the
+ * whole scale, which is every knob made before the rows existed. */
+function knobLow(knob) {
+    return typeof knob.min === "number" ? Math.max(0, Math.min(knobMaxStep(knob), knob.min)) : 0;
+}
+
+function knobHigh(knob) {
+    const top = knobMaxStep(knob);
+    return typeof knob.max === "number" ? Math.max(0, Math.min(top, knob.max)) : top;
+}
+
+function clampKnobValue(knob) {
+    const lo = knobLow(knob), hi = Math.max(knobLow(knob), knobHigh(knob));
+    knob.value = Math.max(lo, Math.min(hi, knob.value));
+}
+
+/* ------------------------------------------------------- the multiplier
+ *
+ * How far one detent moves the value, counted in CC steps so that 1x is
+ * what the knobs have always done whatever scale they are on: one CC per
+ * detent, which on a hex knob is two bytes. 1/2x is therefore the setting
+ * that walks a hex knob through every byte, and 1/4x and 1/3x are for a
+ * parameter where a whole CC is too coarse a jump to hear.
+ *
+ * Fractions need somewhere to accumulate: a quarter of a step is nothing
+ * on its own, and four of them are one. The remainder is deliberately NOT
+ * saved - it is a property of the gesture in progress, not of the song. */
+const KNOB_MULT_OPTIONS = ["1/4x", "1/3x", "1/2x", "1x", "2x"];
+const KNOB_MULT_FACTORS = [0.25, 1 / 3, 0.5, 1, 2];
+const KNOB_MULT_DEFAULT = 3;          /* 1x */
+const knobAccum = new WeakMap();
+
+function knobMultIndex(knob) {
+    const i = knob.mult;
+    return typeof i === "number" && i >= 0 && i < KNOB_MULT_OPTIONS.length ? i : KNOB_MULT_DEFAULT;
+}
+
+/* Steps of the knob's own scale per detent. */
+function knobStepPerDetent(knob) {
+    return KNOB_MULT_FACTORS[knobMultIndex(knob)] * (knobFineHex(knob) ? 2 : 1);
+}
+
+/* How many whole steps this detent is worth, carrying the remainder. */
+function knobDetentSteps(knob, dir) {
+    const acc = (knobAccum.get(knob) || 0) + dir * knobStepPerDetent(knob);
+    const whole = acc < 0 ? Math.ceil(acc) : Math.floor(acc);
+    knobAccum.set(knob, acc - whole);
+    return whole;
+}
+
+/* Switching Display across the hex boundary changes what the numbers
+ * COUNT, so the position has to be re-expressed or the knob jumps: 7F
+ * on a 0-127 knob and 7F on a hex one are opposite ends of the travel. */
+function rescaleKnobForDisplay(knob, wasFine) {
+    const isFine = knobFineHex(knob);
+    if (isFine === wasFine) return;
+    const conv = (v) => Math.max(0, Math.min(isFine ? 255 : 127,
+                                             isFine ? v * 2 : Math.round(v / 2)));
+    knob.value = conv(knob.value);
+    if (typeof knob.default === "number") knob.default = conv(knob.default);
+    if (typeof knob.min === "number") knob.min = conv(knob.min);
+    if (typeof knob.max === "number") knob.max = conv(knob.max);
+}
+
 const DEFAULT_SETTINGS = {
     /* MIDI channel for the song knobs' CCs, 0-15 on the wire. M8's
      * CONTROL MAP CHANNEL (MIDI Settings view) has to agree with this or
@@ -1779,18 +1868,24 @@ const M8_GENERIC_SHAPES = (() => {
 
 function makeKnobConfig(cc, opts) {
     const o = opts || {};
-    /* A byte-scaled default halves into the 0-127 the knob stores and
-     * sends; a note-scaled one is already in that range. See M8_NOTE_SCALE. */
+    /* The catalogue's defaults are M8 BYTES. A hex knob counts in bytes
+     * too, so the default goes in as it stands; a knob on any other
+     * display counts in CC steps and halves it. A note-valued parameter
+     * is 0-127 on the M8 itself either way. See M8_NOTE_SCALE and
+     * knobFineHex. */
     const noteScaled = o.scale === M8_NOTE_SCALE;
-    const raw = o.def === undefined ? 0 : (noteScaled ? o.def : o.def / 2);
-    const value = Math.max(0, Math.min(127, Math.round(raw)));
+    const display = o.display === undefined ? KNOB_DISPLAY_HEX : o.display;
+    const fine = display === KNOB_DISPLAY_HEX && !noteScaled;
+    const top = fine ? 255 : 127;
+    const raw = o.def === undefined ? 0 : (noteScaled || fine ? o.def : o.def / 2);
+    const value = Math.max(0, Math.min(top, Math.round(raw)));
     const knob = {
         name: o.name || "PRM",
         cc,
         value,
         default: value,
         mode: KNOB_MODE_ABSOLUTE,
-        display: o.display === undefined ? KNOB_DISPLAY_HEX : o.display,
+        display,
     };
     /* Only the exception is stored, so an ordinary knob's saved form is
      * unchanged and every song written before this still loads as
@@ -2216,6 +2311,7 @@ function loadSongs() {
             } else if (parsed && Array.isArray(parsed.songs)) {
                 songs = parsed.songs;
                 activeSongId = parsed.activeSongId || null;
+                migrateKnobScale(parsed.schema);
                 /* Merged over the defaults rather than replacing them, so
                  * a file written before a setting existed still loads and
                  * simply takes that setting's default. */
@@ -2406,13 +2502,47 @@ function tickModuleConfig() {
     markSongsDirty();
 }
 
+/* SONGS WRITTEN BEFORE HEX KNOBS COUNTED IN BYTES.
+ *
+ * A hex knob stored 0-127 and showed it doubled; it stores the byte
+ * itself now. Every value, default and (there were none yet) clamp on
+ * such a knob therefore doubles once, and the file is stamped so it
+ * cannot happen twice. Anything else - 0-127, 0-1, -1..1, note-valued -
+ * counted in CC steps before and still does. */
+const SONGS_SCHEMA = 2;
+
+function migrateKnobScale(schema) {
+    if (schema >= SONGS_SCHEMA) return;
+    let touched = 0;
+    for (const song of songs) {
+        for (const page of song.pages || []) {
+            for (const knob of page.knobs || []) {
+                if (!knob || !knobFineHex(knob)) continue;
+                const grow = (v) => Math.max(0, Math.min(255, v * 2));
+                knob.value = grow(knob.value || 0);
+                if (typeof knob.default === "number") knob.default = grow(knob.default);
+                if (typeof knob.min === "number") knob.min = grow(knob.min);
+                if (typeof knob.max === "number") knob.max = grow(knob.max);
+                touched++;
+            }
+        }
+    }
+    if (!touched) return;
+    console.log(`migrateKnobScale: ${touched} hex knob(s) rescaled to bytes`);
+    /* Only when something actually moved. A blanket mark here would
+     * leave the module permanently dirty after every load, and
+     * tickSongsFile stands off while there are unsaved local edits -
+     * so an edit made in the browser would never be picked up. */
+    markSongsDirty();
+}
+
 function saveSongs() {
     const f = std.open(SONGS_PATH, "w");
     if (!f) {
         console.log(`saveSongs: failed to open ${SONGS_PATH} for writing`);
         return;
     }
-    const body = JSON.stringify({ activeSongId, settings, songs });
+    const body = JSON.stringify({ schema: SONGS_SCHEMA, activeSongId, settings, songs });
     f.puts(body);
     f.close();
     /* So the watcher below can tell our own write from someone else's. */
@@ -2858,11 +2988,19 @@ function handleKnobSelectInput(data) {
  * "add" is here as well as on an empty slot because a FULL page has no
  * empty slot left to touch - that is the case auto-page-creation exists
  * for, and without a second door it would be unreachable. */
-const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "mode", "display", "move", "add", "remove"];
+const KNOB_SETTINGS_FIELDS = ["name", "connect", "cc", "mode", "display", "mult",
+                              "min", "max", "move", "add", "remove"];
 const KNOB_SETTINGS_LABELS = {
     name: "Name", connect: "Connect", cc: "CC", mode: "Mode", display: "Display",
+    mult: "Speed", min: "Min", max: "Max",
     move: "Slot", add: "Add Knob", remove: "Remove Knob",
 };
+
+/* Min and Max are ends of the travel, so they read in the knob's own
+ * display - a hex knob's clamp is 30 to 4F, not 48 to 79. A shifted
+ * turn steps by eight, because walking 256 bytes one detent at a time
+ * is not a thing anyone should be asked to do. */
+const KNOB_LIMIT_COARSE = 8;
 
 let knobEditOpen = false;
 let knobEditIndex = -1;
@@ -3027,7 +3165,21 @@ function handleKnobEditInput(data) {
         } else if (field === "mode") {
             knob.mode = Math.max(0, Math.min(KNOB_MODE_OPTIONS.length - 1, knob.mode + Math.sign(delta)));
         } else if (field === "display") {
+            const wasFine = knobFineHex(knob);
             knob.display = Math.max(0, Math.min(KNOB_DISPLAY_OPTIONS.length - 1, knob.display + Math.sign(delta)));
+            rescaleKnobForDisplay(knob, wasFine);
+        } else if (field === "mult") {
+            knob.mult = Math.max(0, Math.min(KNOB_MULT_OPTIONS.length - 1,
+                                             knobMultIndex(knob) + Math.sign(delta)));
+            knobAccum.delete(knob);
+        } else if (field === "min" || field === "max") {
+            const step = Math.sign(delta) * (shiftHeld ? KNOB_LIMIT_COARSE : 1);
+            const top = knobMaxStep(knob);
+            const now = field === "min" ? knobLow(knob) : knobHigh(knob);
+            const next = Math.max(0, Math.min(top, now + step));
+            if (field === "min") knob.min = Math.min(next, knobHigh(knob));
+            else knob.max = Math.max(next, knobLow(knob));
+            clampKnobValue(knob);
         } else if (field === "move") {
             moveKnobSlot(Math.sign(delta));
         }
@@ -3104,6 +3256,9 @@ function drawKnobEdit() {
             if (field === "cc") return String(knob.cc);
             if (field === "mode") return KNOB_MODE_OPTIONS[knob.mode];
             if (field === "display") return KNOB_DISPLAY_OPTIONS[knob.display];
+            if (field === "mult") return KNOB_MULT_OPTIONS[knobMultIndex(knob)];
+            if (field === "min") return formatKnobLimit(knob, knobLow(knob));
+            if (field === "max") return formatKnobLimit(knob, knobHigh(knob));
             if (field === "move") {
                 /* A range when a graphic moves as one, so the row says
                  * that the whole picture travels rather than this knob. */
@@ -3791,13 +3946,15 @@ function revertAuditionedKnobs() {
             /* Relative knobs send movement, not position, so the revert
              * is the opposite movement. Move's encoding is 1-63 for
              * clockwise and 65-127 for anticlockwise (see decodeDelta),
-             * and one message carries the whole correction. */
-            const size = Math.min(63, Math.abs(delta));
-            move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
-                                     knob.cc, delta > 0 ? size : 64 + size]);
+             * and one message carries the whole correction. The wire
+             * counts CC steps, so a hex knob's two bytes are one. */
+            const ccDelta = knobFineHex(knob) ? Math.round(delta / 2) : delta;
+            const size = Math.min(63, Math.abs(ccDelta));
+            if (size) move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
+                                               knob.cc, ccDelta > 0 ? size : 64 + size]);
         } else {
             move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel,
-                                     knob.cc, knob.value]);
+                                     knob.cc, knobCcValue(knob)]);
         }
     }
     auditionedKnobs.clear();
@@ -3854,9 +4011,22 @@ function isKnobReadoutActive(index) {
  * M8's own parameter values are a byte (00-FF) reached by doubling the 7-bit
  * CC, so the readout must double too or it reads half of what the M8 screen
  * shows for the same knob position. */
+/* An end of the travel, in whatever the knob counts in. The value
+ * formatter works off knob.value, so this borrows it with the limit
+ * standing in - same rounding, same hex padding, one set of rules. */
+function formatKnobLimit(knob, step) {
+    const real = knob.value;
+    knob.value = step;
+    const text = formatKnobReadoutValue(knob);
+    knob.value = real;
+    return text;
+}
+
 function formatKnobReadoutValue(knob) {
     if (knob.display === KNOB_DISPLAY_HEX) {
-        const shown = knob.scale === M8_NOTE_SCALE ? knob.value : knob.value * 2;
+        /* The byte IS the value now - see knobFineHex. A note-valued
+         * parameter is 0-127 on the M8 too, so it shows as it stands. */
+        const shown = knob.value;
         return shown.toString(16).toUpperCase().padStart(2, "0");
     }
     /* The normalised readings work off the CC range the knob actually
@@ -3894,7 +4064,9 @@ function drawSongPage() {
 
     const values = {};
     cachedChainParams.forEach((p, i) => {
-        if (p) values[p.key] = page.knobs[i].value;
+        /* The dials and the pictures are drawn against a 0-127 param, so
+         * a hex knob hands over its CC rather than its byte. */
+        if (p) values[p.key] = knobCcValue(page.knobs[i]);
     });
 
     /* renderPage draws only the graphics it is HANDED - resolution and
@@ -4002,14 +4174,22 @@ function handleSongKnobTurn(data) {
     const knob = page.knobs[knobIndex];
     if (!knob) return; /* empty slot - this encoder controls nothing here */
     noteAuditionValue(knob);
-    knob.value = Math.max(0, Math.min(127, knob.value + Math.sign(delta)));
+    /* The multiplier can make a detent worth less than a whole step, so
+     * some detents move nothing and only carry the remainder. The
+     * readout is still claimed for them: the knob is being turned, and
+     * a screen that ignored the first three detents of a 1/4x knob
+     * would look broken. */
+    const steps = knobDetentSteps(knob, Math.sign(delta));
     claimKnobTurn(knobIndex);
+    if (steps === 0) return;
+    knob.value = Math.max(knobLow(knob),
+                          Math.min(knobHigh(knob), knob.value + steps));
     /* Absolute: send the accumulated 0-127 value we track (today's
      * behaviour). Relative: forward Move's own relative encoder byte as-is
      * (1-63 CW, 65-127 CCW) and let M8 do the accumulating - `knob.value`
      * still tracks an approximate position for the on-screen display either
      * way, but isn't what's on the wire in this mode. */
-    const wireValue = knob.mode === KNOB_MODE_RELATIVE ? data[2] : knob.value;
+    const wireValue = knob.mode === KNOB_MODE_RELATIVE ? data[2] : knobCcValue(knob);
     move_midi_external_send([2 << 4 | 0xb, 0xb0 | settings.knobChannel, knob.cc, wireValue]);
     markSongsDirty();
 }

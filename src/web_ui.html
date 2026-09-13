@@ -105,7 +105,9 @@ a couple of seconds.</p>
 </div>
 
 <p class="note">Only slots that hold a knob are listed; each page ends with a tile for the
-next free one. A knob's <strong>connection</strong> — which M8 parameter it stands for — is
+next free one. <strong>SPD</strong> is how far one detent moves the value, counted in CC steps
+— 1/2x is what walks a hex knob through every byte — and <strong>MIN/MAX</strong> are the ends
+of its travel, written in whatever the knob reads in. A knob's <strong>connection</strong> — which M8 parameter it stands for — is
 chosen from the catalogue on the Move, and so is the picture a group of knobs draws. Both are
 shown here and carried through untouched. What this page edits is the name, the CC, the send
 mode and the value display, plus adding, removing and moving between slots.</p>
@@ -126,7 +128,24 @@ var UPLOAD_URL = "/files/upload";
 
 var MODES = ["Absolute", "Relative"];
 var DISPLAYS = ["0-127", "Hex", "0-1", "-1..1"];
+var MULTS = ["1/4x", "1/3x", "1/2x", "1x", "2x"];
+var MULT_DEFAULT = 3;
 var SLOTS_PER_PAGE = 8;
+
+/* A knob set to Hex counts in M8 BYTES, 0-255, and sends value >> 1;
+ * every other display counts in CC steps, 0-127. */
+function fineHex(knob) { return knob.display === 1 && knob.scale !== 0x7F; }
+function maxStep(knob) { return fineHex(knob) ? 255 : 127; }
+function limitLow(knob) { return typeof knob.min === "number" ? knob.min : 0; }
+function limitHigh(knob) { return typeof knob.max === "number" ? knob.max : maxStep(knob); }
+/* Hex knobs read in hex, so the boxes do too. */
+function showStep(knob, v) {
+    return fineHex(knob) ? v.toString(16).toUpperCase() : String(v);
+}
+function parseStep(knob, text) {
+    var v = parseInt(text, fineHex(knob) ? 16 : 10);
+    return isNaN(v) ? null : Math.max(0, Math.min(maxStep(knob), v));
+}
 
 var doc = null;
 var dirty = false;
@@ -255,13 +274,15 @@ function emptyPage() {
 }
 
 function newKnob(song) {
+    /* Hex, so it counts in bytes - 0x80 is the middle of that travel. */
     return {
         name: "KNB",
         cc: nextFreeCc(song),
-        value: 64,
-        default: 64,
+        value: 128,
+        default: 128,
         mode: 0,
-        display: 1
+        display: 1,
+        mult: MULT_DEFAULT
     };
 }
 
@@ -352,9 +373,50 @@ function renderSlot(song, page, pi, si, dupes) {
     });
     disp.value = String(knob.display === undefined ? 1 : knob.display);
     disp.title = "How its value reads on the Move's screen";
-    disp.addEventListener("change", function () { knob.display = parseInt(disp.value, 10); markDirty(); });
+    disp.addEventListener("change", function () {
+        /* 7F on a 0-127 knob and 7F on a hex one are opposite ends of
+         * the travel, so the position is re-expressed rather than kept
+         * as a number - the same conversion the module does. */
+        var wasFine = fineHex(knob);
+        knob.display = parseInt(disp.value, 10);
+        var isFine = fineHex(knob);
+        if (wasFine !== isFine) {
+            var conv = function (v) {
+                return Math.max(0, Math.min(isFine ? 255 : 127,
+                                            isFine ? v * 2 : Math.round(v / 2)));
+            };
+            knob.value = conv(knob.value);
+            if (typeof knob.default === "number") knob.default = conv(knob.default);
+            if (typeof knob.min === "number") knob.min = conv(knob.min);
+            if (typeof knob.max === "number") knob.max = conv(knob.max);
+        }
+        markDirty();
+        render();
+    });
     row.appendChild(disp);
     card.appendChild(row);
+
+    var row3 = el("div", "row2");
+    row3.appendChild(el("label", null, "SPD"));
+    var mult = document.createElement("select");
+    MULTS.forEach(function (label, i) {
+        var o = document.createElement("option");
+        o.value = String(i); o.textContent = label;
+        mult.appendChild(o);
+    });
+    mult.value = String(typeof knob.mult === "number" ? knob.mult : MULT_DEFAULT);
+    mult.title = "How far one detent moves it, counted in CC steps. " +
+                 "1/2x is what walks a hex knob through every byte.";
+    mult.addEventListener("change", function () {
+        knob.mult = parseInt(mult.value, 10);
+        markDirty();
+    });
+    row3.appendChild(mult);
+
+    row3.appendChild(el("label", null, fineHex(knob) ? "MIN/MAX HEX" : "MIN/MAX"));
+    row3.appendChild(limitBox(knob, "min"));
+    row3.appendChild(limitBox(knob, "max"));
+    card.appendChild(row3);
 
     var conn = el("div", "conn" + (knob.detail ? "" : " none"),
                   knob.detail || "no connection recorded");
@@ -387,6 +449,28 @@ function renderSlot(song, page, pi, si, dupes) {
     card.appendChild(foot);
 
     return card;
+}
+
+/* An end of the travel. Blank means "no limit", which is what every
+ * knob made before these existed has. */
+function limitBox(knob, which) {
+    var box = document.createElement("input");
+    box.type = "text";
+    box.className = "cc";
+    box.value = showStep(knob, which === "min" ? limitLow(knob) : limitHigh(knob));
+    box.title = which === "min" ? "Lowest value this knob can reach"
+                                : "Highest value this knob can reach";
+    box.addEventListener("change", function () {
+        var v = parseStep(knob, box.value);
+        if (v === null) { box.value = showStep(knob, which === "min" ? limitLow(knob) : limitHigh(knob)); return; }
+        if (which === "min") knob.min = Math.min(v, limitHigh(knob));
+        else knob.max = Math.max(v, limitLow(knob));
+        /* A value outside its own travel makes no sense. */
+        knob.value = Math.max(limitLow(knob), Math.min(limitHigh(knob), knob.value));
+        markDirty();
+        render();
+    });
+    return box;
 }
 
 /* Only ever called for an ungrouped knob, and it refuses to displace a
