@@ -9,7 +9,7 @@ import * as std from "std";
 
 /* Shared utilities - absolute path for module location independence */
 import {
-    MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete,
+    MoveMenu, MoveBack, MoveCapture, MoveShift, MoveDelete, MoveCopy,
     MoveMainButton, MoveMainTouch, MoveMainKnob, MoveMasterTouch,
     MovePlay, MoveRec, MoveLoop, MoveMute, MoveUndo,
     MovePad32, MidiClock, MoveRGBLeds, MoveUp, MoveDown
@@ -31,6 +31,10 @@ import {
 import {
     drawMenuList, drawMenuHeader, drawMenuFooter, drawStatusOverlay
 } from '/data/UserData/schwung/shared/menu_layout.mjs';
+/* Where the chrome starts. The knob grid is given everything above it
+ * and the hint bar everything below, which is the division every other
+ * Schwung param page uses. */
+import { RULE_Y } from '/data/UserData/schwung/shared/list_geometry.mjs';
 import {
     openTextEntry, isTextEntryActive, handleTextEntryMidi, tickTextEntry, drawTextEntry
 } from '/data/UserData/schwung/shared/text_entry.mjs';
@@ -183,14 +187,16 @@ const RGB_PRESET_DIM = 6;      /* #491804 ochre */
 
 /* ------------------------------------------------- the knobs' own leds
  *
- * Each of the eight knobs has a lit ring, addressed by the same CC the
- * knob turns on (71-78) and written on the 24th-note TRANSITION channel
+ * Each of the eight knobs has a light under it - the Move has no LED
+ * collar around the knob, one lamp beneath it - addressed by the same
+ * CC the knob turns on (71-78) and written on the 24th-note TRANSITION
+ * channel
  * so the colour slides rather than snapping. A sweep is a short list of
  * palette entries walked by the knob's position: the bottom of the
  * travel is the first entry, the top the last.
  *
  * These four lists came from the module's original virtual_knobs.mjs,
- * which lit the rings before the knobs became song-shaped. Knob 9 is
+ * which lit them before the knobs became song-shaped. Knob 9 is
  * left alone - it is the master, it belongs to no song, and the old
  * code had to borrow the Sample button's led to show it at all. */
 const KNOB_LED_CCS = [71, 72, 73, 74, 75, 76, 77, 78];
@@ -353,8 +359,21 @@ const animatedPads = new Map();
  * Tuned on the device three times: 10 was far too fast, 16 still read
  * as a flicker rather than a pulse. Raise it further to slow it down;
  * nothing else depends on the number. */
-const PAD_FLIP_TICKS = 28;
-let padFlipCount = 0;
+/* THE FLASH IS TIMED FROM THE CLOCK, NOT FROM A TICK COUNT.
+ *
+ * It used to flip every PAD_FLIP_TICKS ticks, which assumes every tick
+ * is the same length. On the device they are not: shadow_ui drives the
+ * module on a ~16ms loop, and the knob page is a far heavier draw than a
+ * menu list - dials, filter and envelope graphics, the whole page every
+ * frame. When that overruns, ticks are dropped and the counter advances
+ * more slowly, so the same flash ran at one speed on the knob page and a
+ * visibly faster one the moment a menu opened. The menu was not speeding
+ * up; the knob page was dragging.
+ *
+ * Milliseconds do not care what is on screen, so one period now means
+ * one period everywhere. 450ms is what 28 ticks of a 16ms loop was
+ * nominally worth - a full cycle, dim and bright, is twice this. */
+const PAD_FLIP_MS = 450;
 let padFlipOn = false;
 
 /* Pads the M8 has painted statically, waiting to see whether a re-arm
@@ -373,11 +392,33 @@ function applyPendingPadStops() {
 
 /* Only writes on the frames the phase actually changes, so a steady
  * screen costs nothing between flips. */
+let padFlipDueAt = 0;
+
 function tickPadAnimation() {
+    /* NOT WHILE THE KEYBOARD HAS THE GRID.
+     *
+     * Blink and pulse are done in software here, a flip every
+     * PAD_FLIP_TICKS - and the flip writes straight to the pads. With
+     * the keyboard up those pads are letters, painted once when it
+     * opened, so a flip a few frames later punched the old screen's
+     * flashing chains back through the middle of them.
+     *
+     * Nothing is lost by pausing: the phase is free-running and the
+     * hand-back repaints the whole grid from memory, which re-arms
+     * every animation from what the M8 last said. */
+    if (padsAreBorrowed()) return;
     applyPendingPadStops();
-    if (!animatedPads.size) { padFlipCount = 0; padFlipOn = false; return; }
-    if (++padFlipCount < PAD_FLIP_TICKS) return;
-    padFlipCount = 0;
+    if (!animatedPads.size) { padFlipDueAt = 0; padFlipOn = false; return; }
+    const now = Date.now();
+    /* First armed pad starts the clock rather than flipping at once -
+     * applyLppLed has just painted it, and a flip in the same frame
+     * would make the first half-period a flicker. */
+    if (!padFlipDueAt) { padFlipDueAt = now + PAD_FLIP_MS; return; }
+    if (now < padFlipDueAt) return;
+    /* Counted from NOW, not from what was due: a frame late should not
+     * make the next one early, which is what accumulating the schedule
+     * would do after a stall. */
+    padFlipDueAt = now + PAD_FLIP_MS;
     padFlipOn = !padFlipOn;
     for (const [note, pair] of animatedPads) {
         move_midi_internal_send([0x09, 0x90, note, padFlipOn ? pair[1] : pair[0]]);
@@ -552,6 +593,86 @@ function traceFlush() {
     }
 }
 
+/* WHAT THE OTHER END IS ACTUALLY SENDING.
+ *
+ * traceLed only ever sees NOTE messages, because that is the only kind
+ * the LED relay acts on - so a device that paints its grid some other
+ * way (a CC, a different channel, a different note numbering) leaves an
+ * empty trace that reads as "nothing arrived". It is not the same
+ * finding, and the difference matters the moment something other than
+ * M8 hardware is on the other end - the iOS build of M8, say.
+ *
+ * So every external message is tallied by kind, and the first few are
+ * kept verbatim. Trace-gated like everything else here: nothing is
+ * counted unless the flag file exists. */
+const traceKinds = new Map();      /* "9n ch1" -> count */
+const traceRaw = [];               /* the first messages, as they arrived */
+const TRACE_RAW_CAP = 48;
+let traceExternalCount = 0;
+
+function traceIncoming(data) {
+    if (!traceOn) return;
+    traceExternalCount++;
+    const status = data[0];
+    const kind = status >= 0xF0
+        ? `sys ${status.toString(16)}`
+        : `${(status & 0xF0).toString(16)}x ch${(status & 0x0F) + 1}`;
+    traceKinds.set(kind, (traceKinds.get(kind) || 0) + 1);
+    if (traceRaw.length < TRACE_RAW_CAP) {
+        traceRaw.push([...data].slice(0, 4).map((b) => b.toString(16).padStart(2, "0")).join(" "));
+    }
+}
+
+/* THE OTHER PLACE AN LED STREAM COULD BE LANDING.
+ *
+ * The host routes by USB cable: cable 2 reaches onMidiMessageExternal,
+ * cable 0 is Move's own surface and reaches onMidiMessageInternal. If
+ * the app writes its LED stream to a different port from the one it
+ * reads - easily done on iOS, where a destination and a source are
+ * separate objects - those writes arrive as "the Move's own buttons"
+ * and are silently discarded as nonsense.
+ *
+ * So anything internal that Move's surface cannot account for is worth
+ * seeing: Move sends knob touches 0-9, steps 16-31 and pads 68-99, and
+ * nothing else. A note 11-67 on the internal side is not a Move
+ * control; it is an LPP grid address that came in the wrong door. */
+function traceStrangeInternal(data) {
+    if (!traceOn) return;
+    const status = data[0] & 0xF0;
+    if (status !== 0x90 && status !== 0x80) return;
+    const note = data[1];
+    const isMoveControl = note <= 9 || (note >= 16 && note <= 31) || (note >= 68 && note <= 99);
+    if (isMoveControl) return;
+    strangeInternal.set(note, (strangeInternal.get(note) || 0) + 1);
+}
+
+const strangeInternal = new Map();
+
+let traceLastCensus = "";
+
+function traceIncomingReport(onlyIfChanged) {
+    if (!traceOn) return;
+    /* One line per state, not one per flush: a device that has been
+     * quiet for a minute should say so once. */
+    const fingerprint = `${traceExternalCount}:${strangeInternal.size}`;
+    if (onlyIfChanged && fingerprint === traceLastCensus) return;
+    traceLastCensus = fingerprint;
+    traceWrite(`  heard ${traceExternalCount} message(s) from the other end`);
+    if (!traceKinds.size) {
+        traceWrite("  kinds: NONE - nothing at all arrived on the external port");
+        return;
+    }
+    traceWrite("  kinds: " + [...traceKinds].map(([k, n]) => `${k} x${n}`).join(", "));
+    if (traceRaw.length) traceWrite("  first messages: " + traceRaw.join(" | "));
+    if (strangeInternal.size) {
+        const notes = [...strangeInternal].sort((a, b) => a[0] - b[0])
+            .map(([n, c]) => `${n}x${c}`).join(" ");
+        traceWrite(`  NOT-A-MOVE-CONTROL notes on the internal side: ${notes}`);
+        traceWrite("  (an LPP grid address arriving on cable 0 means the other");
+        traceWrite("   end is writing to a different port than it reads)");
+    }
+}
+
 /* Start collecting the lit set for the screen just entered. */
 function traceScreen(label) {
     if (!traceOn) return;
@@ -619,6 +740,7 @@ function traceReport() {
         traceWrite("  pads sent animated: NONE - every message was channel 1");
     }
     traceWrite(`  (${traceEvents.length} led messages in this window${traceEvents.length >= TRACE_EVENT_CAP ? ", capped" : ""})`);
+    traceIncomingReport();
     traceLabel = "";
     traceEvents = [];
     traceFlush();
@@ -640,6 +762,14 @@ function traceTick() {
     }
     if (++traceFlushCount >= TRACE_FLUSH_EVERY) {
         traceFlushCount = 0;
+        /* SILENCE HAS TO PRINT TOO.
+         *
+         * The census used to go out only with a screen report, and a
+         * screen report only happens once something has connected - so
+         * the single most important finding, that nothing arrived at
+         * all, left an empty file that reads like a broken tracer. It
+         * is written on every flush now, whenever it has changed. */
+        traceIncomingReport(true);
         traceFlush();
     }
 }
@@ -665,21 +795,75 @@ function advanceViewMode() {
  * which is where everything used to start. */
 const viewModeByMode = new Map();
 
+/* Everything the M8 has lit on the GRID, forgotten. The control leds
+ * are left alone: Play, Rec and the arrows belong to the device rather
+ * than to a screen, and the M8 does not resend them. */
+function forgetGrid() {
+    for (const note of lppNoteValueMap.keys()) {
+        if (note >= 11 && note <= 88) lppNoteValueMap.set(note, [0, 0, 0]);
+    }
+}
+
 function switchLpMode(target) {
     if (target === lpMode) return;
     viewModeByMode.set(lpMode, viewMode);
     const remembered = viewModeByMode.get(target);
     lpMode = target;
     viewMode = remembered === undefined ? VIEW_TOP : remembered;
+    /* A MODE CHANGE IS THE HARDWARE'S TO PAINT.
+     *
+     * The remembered grid belongs to the screen being left, and the M8
+     * repaints for a screen change anyway - so replaying it here would
+     * put the old screen's pads up for the moment it takes the M8 to
+     * send the new ones. Forgetting first means the pads go dark and
+     * fill in with what is actually there. Switching HALVES is not a
+     * mode change and keeps its memory: the M8 sends nothing for that,
+     * and the cache is all there is. */
+    forgetGrid();
     queuePadRedraw();
 }
 let shiftHeld = false;
+
+/* EVERY change to Shift goes through here, because the lamp under step 1
+ * has to follow it.
+ *
+ * The five menu screens track Shift for themselves - each owns input
+ * while it is up, and the main dispatch never sees those messages - and
+ * every one of them used to set the flag directly. So the lamp stayed
+ * lit after the key was let go, which the shortcut guarantees you will
+ * hit: Shift+step 1 opens Songs, and Songs is then the screen that sees
+ * the release. */
+function setShiftHeld(down) {
+    shiftHeld = down;
+    showShiftStepHint(down);
+    updateKnobCursorHints();
+}
 let liveMode = false;
 let isPlaying = false;
 let currentView = moveBACK;
 let sysexBuffer = [];
+/* The universal Device Inquiry, which is how the other end asks what we
+ * are: F0 7E <device id> 06 01 F7. The hardware M8 broadcasts it with
+ * 7F ("all call"), and this used to match that byte for byte - so an
+ * inquiry carrying any OTHER device id, which the spec allows and other
+ * hosts do send, fell through to the "some other sysex" branch. That
+ * branch marks us connected, and being connected is what stops the
+ * proactive identity retry: we would fall silent without ever having
+ * answered, and a host waiting to be told a Launchpad is present never
+ * paints a thing. So the id byte is ignored. */
 const m8InitSysex = [0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7];
+
+function isDeviceInquiry(bytes) {
+    return bytes.length === 6
+        && bytes[0] === 0xf0 && bytes[1] === 0x7e
+        && bytes[3] === 0x06 && bytes[4] === 0x01 && bytes[5] === 0xf7;
+}
 let m8Connected = false;  /* Track if M8 has connected */
+/* Set when a snapshot gave us a screen we have not been able to confirm.
+ * While it stands the module says NOTHING to the M8 - see tick() - so an
+ * M8 that is sitting there quietly is not knocked off the screen it is
+ * on just to prove it exists. Cleared the moment the M8 speaks. */
+let awaitingM8WithSnapshot = false;
 let initRetryTicks = 0;   /* Ticks since startup for retry logic */
 const INIT_RETRY_INTERVAL = 60;  /* Send init every ~1 second if not connected */
 
@@ -822,9 +1006,67 @@ function drainPadRedraw() {
  * Returns true when the keyboard consumed the message. */
 function routeTextEntryInput(data) {
     if (!isTextEntryActive()) return false;
+    /* SHIFT IS STILL TRACKED IN HERE.
+     *
+     * The keyboard takes every message, which is right for the pads -
+     * they are letters while it is up - but it also swallowed the Shift
+     * RELEASE. And the keyboard is reached BY holding Shift: Shift+jog
+     * click renames a song. So the flag was set on the way in, the
+     * release never arrived, and Shift stayed stuck down for the rest
+     * of the session - long after the keyboard had gone.
+     *
+     * Tracked, then passed on rather than consumed here, so the
+     * keyboard can still use Shift for whatever it likes. */
+    if (data[0] === 0xb0 && data[1] === moveSHIFT) setShiftHeld(data[2] === 127);
     handleTextEntryMidi(data);
-    if (!isTextEntryActive()) queuePadRedraw();
+    /* The hand-back is NOT done here - see tickTextEntryHandback. */
     return true;
+}
+
+/* THE KEYPRESS THAT CLOSES THE KEYBOARD NEVER REACHES THIS MODULE.
+ *
+ * shadow_ui.js handles internal MIDI before it routes anything to a
+ * loaded module, and one of the things it does first is:
+ *
+ *     if (isTextEntryActive()) {
+ *         if (handleTextEntryMidi(data)) { ...; return; }   // consumed
+ *     }
+ *
+ * The keyboard lives in shared/text_entry.mjs, one instance for the
+ * whole realm, so the host's check is true whenever OUR keyboard is
+ * open. Every keystroke, the closing one included, is consumed up
+ * there and never dispatched down here. Repainting "when the keyboard
+ * hands back" therefore never ran at all: the next message this module
+ * saw was whatever came after the keyboard was already gone - the Back
+ * that closed the menu, which is exactly when the pads used to return.
+ *
+ * A transition cannot be watched for in input we never receive, so it
+ * is watched for in the TICK, which does still run. */
+let textEntryWasActive = false;
+
+/* Opening it is the one moment this module is certainly running, so the
+ * watch is armed here rather than left for a tick to notice. A keyboard
+ * that opened and closed between two frames would otherwise look like
+ * nothing having happened. */
+function openKeyboard(opts) {
+    textEntryWasActive = true;
+    openTextEntry(opts);
+}
+
+function tickTextEntryHandback() {
+    const active = isTextEntryActive();
+    if (active === textEntryWasActive) return;
+    textEntryWasActive = active;
+    if (active) return;                 /* it has just taken the pads */
+
+    /* text_entry raises host_pad_block(1) to type on the pads and
+     * leaves it raised - the host lowers it again on its own next tick,
+     * but doing it here means the repaint below is not racing that. */
+    if (typeof host_pad_block === "function") host_pad_block(0);
+    /* The keyboard borrows the PADS, but the buttons and the step row
+     * were cleared with them - so the hand-back puts the whole surface
+     * back from memory, not just the grid. */
+    repaintFromMemory();
 }
 
 /* `force` pushes past setButtonLED's cache, which otherwise suppresses
@@ -861,6 +1103,94 @@ function updateMoveViewPulse(force) {
  * behind it, dark for one that does not - so the row says both how many
  * songs there are and where you are among them. */
 const SONG_STEP_NOTES = [17, 19, 21, 23, 25, 27, 29, 31];
+
+/* TWO MENUS ON THE STEP ROW, BEHIND SHIFT.
+ *
+ * Step 1 opens Songs and step 2 opens Settings, which used to be one
+ * screen with the song list as its first row.
+ *
+ * The two steps are different kinds of button and each needs its own
+ * care. Step 1 is note 16, which is the Launchpad's T1 - part of the
+ * grid, forwarded to the M8, and with its led painted by the M8. So the
+ * press is intercepted before the grid ever sees it, and the led is
+ * BORROWED while Shift is held and handed straight back on release.
+ * Step 2 is note 17, one of this module's own song-preset buttons,
+ * which the M8 never sees at all - there the plain press still picks a
+ * song and only the shifted one opens Settings. */
+const SONGS_STEP_NOTE = 16;
+const SETTINGS_STEP_NOTE = 17;
+
+/* Shift lights the small led BELOW step 1, so the shortcut is visible
+ * rather than something you have to know.
+ *
+ * Below, not the step button itself: the row of little leds under the
+ * steps is a separate address space - CCs 16-31 - from the step buttons
+ * above them, which are notes 16-31. The same numbers, different leds.
+ * CC 31 is the one the M8 lights as the Launchpad logo; the other
+ * fifteen are unused by both sides, so this one is free to borrow and
+ * there is nothing to hand back. Lighting the step BUTTON would mean
+ * taking T1's colour off the M8 and putting it back afterwards.
+ *
+ * Step 2 needs no hint: it is already lit as a song preset. */
+const SHIFT_HINT_CC = 16;
+
+/* A BRIGHTNESS, and ledFor() must not be asked for it.
+ *
+ * The lamps under the steps are WHITE leds - they read the byte as a
+ * brightness, 0-127 - while the step buttons above them are RGB and read
+ * it as a palette index. ledFor() decides which by looking the control
+ * up in MoveRGBLeds, and that list holds MoveSteps, the step NOTES
+ * 16-31. It has no way to know this 16 is a CC, so it would answer "RGB"
+ * and hand back a palette index.
+ *
+ * That is not a theoretical mix-up: the first version of this wrote
+ * RGB_PRESET, palette index 8, and a white led read the 8 as a
+ * brightness of 8 out of 127 - lit, but so faintly it looked broken.
+ * CCs 16-31 are the one range where the two address spaces collide on
+ * the same numbers, so they are written directly. */
+function showShiftStepHint(on) {
+    setButtonLED(SHIFT_HINT_CC, on ? WHITE_BRIGHT : 0x00, true);
+}
+
+/* COPY AND DELETE LIGHT UP WHEN THEY ARE ON OFFER.
+ *
+ * Held with Shift, those two buttons duplicate and remove whatever the
+ * cursor is on - a knob on the knob cursor, a song in the song list.
+ * One pair of gestures across both screens, so they are advertised the
+ * same way on both rather than left to be discovered.
+ *
+ * Only while the offer actually stands: Shift down, and something under
+ * the cursor to act on. An empty knob slot and the song list's "+ Add
+ * Song" row both offer nothing, and a lit button that does nothing is
+ * worse than an unlit one.
+ *
+ * Both belong to the M8 the rest of the time - Copy is the Launchpad's
+ * Duplicate and Delete its Clear - so the colour is borrowed and handed
+ * straight back to whatever the M8 last said it was. */
+const KNOB_HINT_CCS = [MoveCopy, MoveDelete];
+let knobHintsLit = false;
+
+function restoreControlLedFor(cc) {
+    const lppNote = controlMapMoveToLpp().get(cc);
+    const data = lppNote === undefined ? null : lppNoteValueMap.get(lppNote);
+    if (data && data[0] !== 0) applyLppLed(data[1], data[2], data[0] & 0xF0, data[0]);
+    else setButtonLED(cc, 0x00, true);
+}
+
+function updateKnobCursorHints() {
+    const page = getActivePage();
+    const onKnob = knobSelectOpen && !!(page && page.knobs[knobSelectIndex]);
+    /* Not while the delete question is up - that screen has taken the
+     * buttons over and neither offer stands until it is answered. */
+    const onSong = songMgmtOpen && !songMgmtConfirm && songMgmtSongIndex() >= 0;
+    const want = shiftHeld && (onKnob || onSong);
+    if (want === knobHintsLit) return;      /* nothing to say */
+    knobHintsLit = want;
+    for (const cc of KNOB_HINT_CCS) {
+        if (want) setButtonLED(cc, WHITE_BRIGHT, true);
+        else restoreControlLedFor(cc);
+    }
+}
 
 function updateSongStepLeds(force) {
     SONG_STEP_NOTES.forEach((note, i) => {
@@ -909,118 +1239,31 @@ const PAD_REASSERT_TICKS = 150;
 const PAD_REASSERT_EVERY = 30;
 let padReassert = 0;
 
-/* ASKING THE M8 TO PAINT, when replaying the cache cannot help.
+/* The M8 is never asked to repaint.
  *
- * Leaving the module does not tell the M8 anything - it goes on
- * believing a Launchpad is attached - so on the way back in it has no
- * reason to send its grid again, and this time there is no cache to
- * replay either, the module having been reloaded. The pads stay dark
- * until something makes the M8 talk, which is why power-cycling it
- * first avoids the problem.
+ * It has no idea the module came or went - there is no "device
+ * disconnected" from the peripheral end of MIDI, and a screen change is
+ * the only thing it repaints for. The module used to exploit that by
+ * pressing Sequencer and then Session on the way in, which worked and
+ * which flickered through a screen nobody asked for. The lit grid is
+ * remembered across an exit now (see loadSurfaceSnapshot), so there is
+ * nothing to ask for: what you left is put straight back.
  *
- * There is no message for this. MIDI has no "device disconnected" from
- * the peripheral end - a host notices a Launchpad leaving because the
- * USB device disappears, which is not something the module can do.
- *
- * What the M8 does repaint for is a SCREEN CHANGE. And it has to be a
- * change: pressing Session while already on Session is a no-op and
- * repaints nothing, which is why asking for it once did not work. So
- * the module steps to Note and straight back to Session, which lands
- * where it started, having painted the whole grid on the way.
- *
- * ARMED FROM init(), NOT FROM markM8Connected. That is the whole
- * reason this did nothing on a reopen: markM8Connected is only ever
- * reached from the incoming-MIDI handler, and an M8 that already
- * believes a Launchpad is attached sends no identity request and no
- * grid - so with the M8 silent the module never considered itself
- * connected, and neither the nudge nor the re-asserts were ever
- * armed. Waiting for the device to speak cannot be the trigger for
- * the code whose job is to make it speak.
- *
- * Conditional on having heard nothing, so an M8 that is already
- * talking is left alone and nobody's screen moves. */
-/* RETRIED RATHER THAN TIMED. One attempt at a guessed delay has been
- * wrong three times now - too early, too close together, or the M8 not
- * yet willing to act on input - and each guess costs a round trip to
- * find out. So the module tries, waits to see whether the M8 answered,
- * and tries again if it did not. Three attempts spread over about
- * eight seconds covers a wide range of "not ready yet" without
- * anyone having to know which one it was.
- *
- * The gap between the two presses is a second, not a third of one: the
- * M8 has to finish painting the other screen before the press that
- * takes it back to Session means anything.
- *
- * The screen it goes out to is the SEQUENCER, not Note. Both work -
- * any screen change repaints the grid - but the sequencer is the
- * better one to be caught on for the moment it takes: it is a phrase
- * and a keyboard rather than a bare keyboard, so a nudge that fails
- * to come back leaves you somewhere more useful. */
-const M8_NUDGE_TICKS = 60;
-const M8_NUDGE_GAP_TICKS = 45;
-const M8_NUDGE_SETTLE_TICKS = 90;
-const M8_NUDGE_ATTEMPTS = 3;
-const M8_PAINTED_ENOUGH = 16;
-let m8NudgeAttempts = 0;
-const LPP_SESSION_NOTE = 93;
-const LPP_SEQ_SCREEN_NOTE = 97;
-let m8NudgeStage = 0;
-let m8NudgeTicks = 0;
+ * A pad can therefore be a moment stale if the M8 moved while the
+ * module was closed. Anything it changes it repaints, so it corrects
+ * itself; and a first run, with nothing remembered, comes up dark until
+ * the M8 next paints - changing screen on the M8 does it. */
 let ledsSeenSinceConnect = 0;
 
+/* A complete press of one LPP control, down and up. The odd view's
+ * two-row scroll uses it to send a whole extra press ahead of the real
+ * one - see the arrow handling in onMidiMessageInternal. */
 function pressOnM8(lppNote) {
     move_midi_external_send([2 << 4 | 0x9, 0x90, lppNote, 100]);
     move_midi_external_send([2 << 4 | 0x8, 0x80, lppNote, 0]);
 }
 
-function armM8Nudge() {
-    ledsSeenSinceConnect = 0;
-    m8NudgeAttempts = 0;
-    m8NudgeStage = 1;
-    m8NudgeTicks = M8_NUDGE_TICKS;
-}
 
-function tickM8Nudge() {
-    if (!m8NudgeStage) return;
-    if (--m8NudgeTicks > 0) return;
-
-    if (m8NudgeStage === 1) {
-        /* A handful of messages is not a repaint. The M8 paints its
-         * grid in dozens - the first connect of a session traces at
-         * around sixty - so anything under this is housekeeping and
-         * the screen still needs asking for. */
-        if (ledsSeenSinceConnect >= M8_PAINTED_ENOUGH) {
-            traceWrite(`  nudge: M8 painted on its own (${ledsSeenSinceConnect} leds)`);
-            m8NudgeStage = 0;
-            return;
-        }
-        m8NudgeAttempts++;
-        traceWrite(`  nudge ${m8NudgeAttempts}: heard ${ledsSeenSinceConnect}, pressing Sequencer`);
-        pressOnM8(LPP_SEQ_SCREEN_NOTE);
-        m8NudgeStage = 2;
-        m8NudgeTicks = M8_NUDGE_GAP_TICKS;
-        return;
-    }
-
-    if (m8NudgeStage === 2) {
-        traceWrite(`  nudge ${m8NudgeAttempts}: pressing Session (heard ${ledsSeenSinceConnect})`);
-        pressOnM8(LPP_SESSION_NOTE);
-        m8NudgeStage = 3;
-        m8NudgeTicks = M8_NUDGE_SETTLE_TICKS;
-        return;
-    }
-
-    /* Did it work? If the M8 answered, stop. If not, and there are
-     * attempts left, go round again - the failure is always "not yet",
-     * never "never". */
-    if (ledsSeenSinceConnect >= M8_PAINTED_ENOUGH || m8NudgeAttempts >= M8_NUDGE_ATTEMPTS) {
-        traceWrite(`  nudge: finished after ${m8NudgeAttempts}, heard ${ledsSeenSinceConnect} leds`);
-        m8NudgeStage = 0;
-        return;
-    }
-    m8NudgeStage = 1;
-    m8NudgeTicks = 1;
-}
 
 function tickPadReassert() {
     if (padReassert <= 0) return;
@@ -1049,6 +1292,180 @@ function tickPadReassert() {
  * cached ones, so replaying the remembered message is enough. A
  * control the M8 has never lit is left alone: some of them are the
  * module's own and updateMoveViewPulse owns those. */
+/* THE GRID, KEPT ACROSS AN EXIT.
+ *
+ * Everything the M8 has lit is already remembered in lppNoteValueMap,
+ * which is what a screen close replays. Leaving the module throws that
+ * away with the rest of the JS context, and the M8 - which has no idea
+ * we went anywhere - sends nothing on the way back in. That is why
+ * coming back used to press Sequencer and then Session: a screen change
+ * is the only thing that makes the M8 repaint, and with nothing
+ * remembered there was nothing else to show.
+ *
+ * So the lit set is written out on the way out and read back on the way
+ * in. What you had is what you get, immediately and without the flicker
+ * through another screen. It can be a moment stale - the M8 may have
+ * moved while we were away - but any change it makes repaints the pads
+ * that changed, and a stale pad is a smaller lie than a wrong screen. */
+function ledsPath() {
+    return `${MODULE_DIR}/leds.json`;
+}
+
+let ledsRestored = false;
+/* Set when a snapshot put a screen back, and cleared the first time the
+ * M8 speaks - see markM8Connected. */
+let surfaceRestored = false;
+
+/* Version 1 was the bare lit map, `{note: [a,b,c]}`. Version 2 wraps it
+ * and adds the screen it belonged to. Both are still read: a device
+ * updated mid-session has a v1 file sitting there, and the only cost of
+ * not recognising it is one dark grid. */
+const SURFACE_SNAPSHOT_VERSION = 2;
+
+/* HOW LONG A REMEMBERED SCREEN IS WORTH TRUSTING.
+ *
+ * Restoring the screen means telling the module the M8 is still there
+ * and still on it, which is the only way to come back without asking the
+ * M8 to repaint and being dragged to Session for it. That assumption is
+ * safe for a quick trip out to the Tools menu and back. It is not safe
+ * after the Move has been sitting switched off, or with the M8 unplugged
+ * - and when it is wrong the cost is the worst kind: a screen full of
+ * stale LEDs that looks live, instead of the "Waiting for M8" screen
+ * that would tell you nothing is connected.
+ *
+ * There is no way to ask. A connected M8 that is simply idle sends
+ * nothing at all, so silence cannot separate "here and quiet" from
+ * "gone" - which rules out waiting a moment and deciding from that. The
+ * clock is the one signal available, so the snapshot gets an age and
+ * stops being trusted once it is stale. Past that it is ignored whole:
+ * no pads, no mode, no half, and the module introduces itself and waits
+ * for the M8 exactly as it does on a first run. */
+const SURFACE_SNAPSHOT_TTL_MS = 2 * 60 * 1000;
+
+/* WHICH SCREEN THE REMEMBERED PADS CAME FROM.
+ *
+ * The lit set is stored by LPP note, and which Move pad a note paints
+ * depends on the half - top, bottom or odd rows - so restoring the
+ * colours without the view paints them onto the wrong pads. The mode
+ * matters for the same reason and for a second one: whether odd rows is
+ * even offered, and which of the three mode buttons lights, are both
+ * read off lpMode. So the screen travels with the pads rather than
+ * being a convenience on top of them. */
+function currentViewButtonFor(mode) {
+    if (mode === LP_NOTE) return moveMENU;
+    if (mode === LP_SEQ) return moveCAP;
+    return moveBACK;          /* both Session screens live on Back */
+}
+
+function saveSurfaceSnapshot() {
+    const lit = {};
+    for (const [note, data] of lppNoteValueMap) {
+        if (data && data[0] !== 0) lit[note] = [data[0], data[1], data[2]];
+    }
+    /* switchLpMode only records a mode's half on the way OUT of it, so
+     * the mode we are leaving on is not in the map yet. */
+    const viewByMode = {};
+    for (const [mode, view] of viewModeByMode) viewByMode[mode] = view;
+    viewByMode[lpMode] = viewMode;
+
+    const f = std.open(ledsPath(), "w");
+    if (!f) return;
+    f.puts(JSON.stringify({
+        v: SURFACE_SNAPSHOT_VERSION,
+        t: Date.now(),
+        leds: lit,
+        mode: lpMode,
+        view: viewMode,
+        viewByMode,
+    }));
+    f.close();
+}
+
+function loadSurfaceSnapshot() {
+    let raw = null;
+    try { raw = std.loadFile(ledsPath()); } catch (e) { return false; }
+    if (!raw) return false;
+    let saved = null;
+    try { saved = std.parseExtJSON(raw); } catch (e) { return false; }
+    if (!saved) return false;
+
+    /* AGE FIRST, before a single value is restored - a stale snapshot is
+     * ignored whole rather than half-applied.
+     *
+     * A negative age counts as stale too. It means the clock has moved
+     * backwards since the file was written, which says the timestamp
+     * cannot be reasoned about rather than that the file is fresh. A v1
+     * file, and a v2 one written before this existed, carry no `t` at
+     * all and are treated the same way. */
+    const age = typeof saved.t === "number" ? Date.now() - saved.t : null;
+    if (age === null || age < 0 || age > SURFACE_SNAPSHOT_TTL_MS) {
+        console.log(`loadSurfaceSnapshot: ignoring a snapshot ${age === null
+            ? "with no timestamp" : `${Math.round(age / 1000)}s old`}`);
+        return false;
+    }
+
+    /* A v1 file has no wrapper - it IS the lit map. */
+    const lit = saved.leds && typeof saved.leds === "object" ? saved.leds : saved;
+
+    let restored = 0;
+    for (const key of Object.keys(lit)) {
+        const data = lit[key];
+        if (!Array.isArray(data) || data.length < 3) continue;
+        lppNoteValueMap.set(Number(key), [data[0], data[1], data[2]]);
+        restored++;
+    }
+
+    const validMode = (m) => m === LP_SESSION || m === LP_SESSION_ALT
+                          || m === LP_NOTE || m === LP_SEQ;
+    const validView = (v) => v === VIEW_TOP || v === VIEW_BOTTOM || v === VIEW_ODD;
+
+    if (validMode(saved.mode)) lpMode = saved.mode;
+    if (validView(saved.view)) viewMode = saved.view;
+
+    viewModeByMode.clear();
+    if (saved.viewByMode && typeof saved.viewByMode === "object") {
+        for (const key of Object.keys(saved.viewByMode)) {
+            const mode = Number(key);
+            const view = saved.viewByMode[key];
+            if (!validMode(mode) || !validView(view)) continue;
+            /* Odd rows describes nothing off the primary Session screen,
+             * so a remembered one there is dropped rather than carried
+             * back in and reconciled away on the first button press. */
+            viewModeByMode.set(mode, view === VIEW_ODD && mode !== LP_SESSION
+                ? VIEW_TOP : view);
+        }
+    }
+
+    /* The setting can have been switched off while we were away - from
+     * the browser, even - which strands a remembered odd view on a cycle
+     * that no longer reaches it. Clamped here rather than through
+     * reconcileOddRowsView, because that repaints, and init queues a
+     * full repaint of its own a few lines later. */
+    if (viewMode === VIEW_ODD && !oddRowsAvailable()) viewMode = VIEW_TOP;
+    currentView = currentViewButtonFor(lpMode);
+
+    surfaceRestored = validMode(saved.mode) || validView(saved.view);
+    console.log(`loadSurfaceSnapshot: ${restored} led(s), mode ${lpMode}, view ${viewMode}`);
+    return restored > 0;
+}
+
+/* Everything we remember, put back on the surface: the pads over the
+ * next few frames, and the rest at once. Used both on the way back into
+ * the module and when the pad keyboard hands the grid back. */
+function repaintFromMemory() {
+    queuePadRedraw();
+    reassertControlLeds();
+    /* Play is the one control led that does not come straight from the
+     * M8's byte - it is derived from transport and live mode through
+     * setButtonLED, which suppresses a value it believes it already
+     * sent. After a screen has owned the surface that belief is wrong,
+     * so this one is forced. */
+    updatePLAYLed(true);
+    updateMoveViewPulse(true);
+    updateSongStepLeds(true);
+    updateKnobLeds(true);
+}
+
 function reassertControlLeds() {
     for (const lppNote of controlMapMoveToLpp().values()) {
         const data = lppNoteValueMap.get(lppNote);
@@ -1076,15 +1493,61 @@ function updatePLAYLed(force) {
     if (liveMode && isPlaying) setButtonLED(movePLAY, navy, force);
 }
 
+/* ---------------------------------------------------------- MIDI-CI
+ *
+ * The iOS build of M8 does not ask the question the hardware asks. It
+ * opens with a MIDI-CI DISCOVERY - F0 7E 7F 0D 70 ... - which is MIDI
+ * 2.0's "who is on this port, and what can you do?", and it says
+ * nothing else until something answers. The hardware M8 sends the
+ * classic Device Inquiry (06 01) instead and starts painting as soon as
+ * it has our identity, so this whole exchange never came up.
+ *
+ * Captured from an iPad, 32 bytes, every field in its place:
+ *
+ *   F0 7E 7F 0D 70 02 | 33 0D 61 3A | 7F 7F 7F 7F | 11 00 00 |
+ *   01 00 | 01 00 | 02 00 00 00 | 1C | 00 00 01 00 | 03 | F7
+ *   ver 1.2, its MUID, broadcast, manufacturer, family, model,
+ *   revision, capabilities, 16k max sysex, output path
+ *
+ * We no longer answer it. A real Pro MK3 does not speak MIDI-CI, and
+ * matching the hardware is what we are after; the reply we used to
+ * send was well-formed and changed nothing. Discovery is still
+ * recognised, because arriving traffic is how we know somebody is
+ * listening. */
+const MIDI_CI_SUB_ID = 0x0D;
+const MIDI_CI_DISCOVERY = 0x70;
+
+function isMidiCiDiscovery(bytes) {
+    return bytes.length >= 30
+        && bytes[0] === 0xF0 && bytes[1] === 0x7E
+        && bytes[3] === MIDI_CI_SUB_ID && bytes[4] === MIDI_CI_DISCOVERY;
+}
+
 function sendLPPIdentity() {
-    /* Send LPP identity response to M8 - this tells M8 "I'm a Launchpad Pro" */
+    /* The Universal Device Inquiry reply: "I am a Launchpad Pro MK3".
+     *
+     * The model matters, not just the maker. Novation's programmer's
+     * reference (LPP3_prog_ref_guide_200415, "Device Inquiry message")
+     * gives the real device's reply as
+     *
+     *   F0 7E 00 06 02 00 20 29 13 01 00 00 <app_version x4> F7
+     *
+     * where 00 20 29 is Novation and 13 01 is the Pro MK3 running its
+     * Application (13 11 would be the bootloader). This used to send
+     * 00 00 for family and model, which names the maker but leaves the
+     * device unidentified - enough for a host to say "a Novation thing
+     * is here", not enough for it to know which Launchpad it is or what
+     * to send it.
+     *
+     * The frames below are hand-packed: five CIN 4 frames of three
+     * bytes, then a CIN 6 frame holding the last two. 17 bytes. */
     let out_cable = 2;
     let LPPInitSysex = [
         out_cable << 4 | 0x4, 0xF0, 126, 0,
         out_cable << 4 | 0x4, 6, 2, 0,
-        out_cable << 4 | 0x4, 32, 41, 0x00,
-        out_cable << 4 | 0x4, 0x00, 0x00, 0x00,
-        out_cable << 4 | 0x4, 0x00, 0x00, 0x00,
+        out_cable << 4 | 0x4, 32, 41, 0x13,
+        out_cable << 4 | 0x4, 0x01, 0x00, 0x00,
+        out_cable << 4 | 0x4, 0x00, 0x01, 0x00,
         out_cable << 4 | 0x6, 0x00, 0xF7, 0x0
     ];
     move_midi_external_send(LPPInitSysex);
@@ -1094,7 +1557,20 @@ function markM8Connected() {
     if (m8Connected) return;
     m8Connected = true;
     initRetryTicks = 0;
-    viewMode = VIEW_TOP;
+    /* First contact normally means the M8 is starting the conversation
+     * from its own first screen, so the pads go back to the top half.
+     * Not when we restored a snapshot: there the M8 has been running all
+     * along and simply has not spoken since we reopened, the screen we
+     * remembered is the one it is still on, and resetting here would
+     * undo the restore on the M8's very first message. Spent once, so a
+     * genuine reconnect later still starts at the top. */
+    const hadSnapshot = surfaceRestored;
+    if (surfaceRestored) {
+        surfaceRestored = false;
+    } else {
+        viewMode = VIEW_TOP;
+    }
+    awaitingM8WithSnapshot = false;
     loadSongs();
     /* After the songs, so a value set in a browser wins over the copy
      * that was written into songs.json when the module last ran. */
@@ -1107,9 +1583,9 @@ function markM8Connected() {
     updateKnobLeds(true);
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
     padReassert = PAD_REASSERT_TICKS;
-    /* Re-armed on a real connect too: this is the ordinary path, where
-     * the M8 has just told us it is there and the grid follows. */
-    armM8Nudge();
+    /* The confirmation we were waiting for. The remembered grid has been
+     * sitting in lppNoteValueMap unpainted since init - put it up now. */
+    if (hadSnapshot) repaintFromMemory();
 }
 
 function initLPP() {
@@ -1118,7 +1594,7 @@ function initLPP() {
 }
 
 /* ============================================================================
- * Song-based knob configuration (docs/plans/2026-09-10-song-based-knob-config.md)
+ * Song-based knob configuration
  *
  * Replaced the fixed 9-bank/9-save-slot system (banksDef/saveBanks/
  * changeBank/changeSave/handleMoveKnobs/knobconfig.json) in the cutover
@@ -1188,13 +1664,23 @@ function makeSongId() {
 const KNOB_MODE_OPTIONS = ["Abs", "Rel"];
 const KNOB_MODE_ABSOLUTE = 0;
 const KNOB_MODE_RELATIVE = 1;
-const KNOB_DISPLAY_OPTIONS = ["0-127", "Hex", "0-1", "-1..1"];
-/* The same four as settings-schema.json spells them, for the main knob's
- * row on the web settings page. */
+/* The last three read a knob the way M8's EQ editor reads it - decibels,
+ * a Q number and hertz - rather than as a number out of the wire. They
+ * are offered to every knob, not just an EQ one: nothing about them is
+ * EQ-specific once the scale is chosen, and a knob pointed at something
+ * else with the same range may as well borrow the format. */
+const KNOB_DISPLAY_OPTIONS = ["0-127", "Hex", "0-1", "-1..1", "dB", "Q", "Hz"];
+/* The main knob keeps the original four. It is a plain pass-through with
+ * no parameter behind it, so an EQ reading would be a number about
+ * nothing - and settings-schema.json spells exactly these for the web
+ * settings page. */
 const MASTER_DISPLAY_KEYS = ["0-127", "hex", "0-1", "-1..1"];
 const KNOB_DISPLAY_HEX = 1;
 const KNOB_DISPLAY_UNIT = 2;
 const KNOB_DISPLAY_BIPOLAR = 3;
+const KNOB_DISPLAY_EQ_GAIN = 4;
+const KNOB_DISPLAY_EQ_Q = 5;
+const KNOB_DISPLAY_EQ_FREQ = 6;
 
 /* ---------------------------------------------------- a knob's own scale
  *
@@ -1686,6 +2172,126 @@ const M8_SEND_GROUPS = [
     },
 ];
 
+/* ------------------------------------------------------------------- EQ
+ *
+ * M8 carries a 3-band parametric EQ in several places at once: 128
+ * numbered slots that instruments are pointed at (an instrument names a
+ * slot rather than owning an EQ, so several can share one), the main mix,
+ * and one for each of the three send effects.
+ *
+ * The bands are LOW, MID and HIGH, and those names describe their
+ * DEFAULTS rather than any fixed role - the manual is explicit that "each
+ * band is functionally identical and can be configured to suit your
+ * needs", so all three offer the same five rows.
+ *
+ * NO FX MNEMONICS EXIST FOR THESE. The Mixer & Effects Commands appendix
+ * publishes only EQM and EQI, and both of those assign a SLOT rather than
+ * move a band. So these follow the catalogue's other rule and take the EQ
+ * editor's own row names, shortened, prefixed with the band.
+ *
+ * THE DEFAULTS ARE THE CONVENTION, NOT A SCREENSHOT. The Instrument View
+ * screenshot could be read for exact bytes because that screen prints
+ * hex; the EQ editor prints decibels and hertz instead (GAIN -05.00,
+ * FREQ 1547, Q 64), so there is no byte on it to copy. GAIN is a boost
+ * or a cut about zero, so it takes the 0x80 that the other bipolar
+ * controls take; FREQ and Q start mid-range on the same reasoning; TYPE
+ * and MODE are enum-ish selectors and start at 0x00, which is their
+ * first entry (LOWCUT and STEREO). As everywhere else in this catalogue
+ * these are only STARTING VALUES - nothing here addresses the M8, which
+ * learns each CC from the knob you turn. */
+/* FREQUENCY IS A TABLE, NOT A CURVE.
+ *
+ * The EQ's frequency runs 37 Hz to 15 kHz over 128 steps, and the spacing
+ * is neither linear nor a clean exponent: it opens in 2 Hz steps
+ * (37, 39, 41 ... 49), then widens unevenly all the way out. So the
+ * readings are listed rather than computed - ONE ENTRY PER CC STEP, which
+ * is what makes the table exactly 128 long and lets a knob's value index
+ * it directly. */
+const M8_EQ_FREQ_TABLE = [
+    37, 39, 41, 43, 45, 47, 49, 52,
+    54, 57, 59, 62, 65, 69, 72, 75,
+    79, 83, 87, 91, 95, 100, 105, 110,
+    115, 121, 127, 133, 139, 146, 153, 160,
+    168, 176, 185, 194, 203, 213, 223, 234,
+    245, 257, 269, 282, 296, 310, 325, 341,
+    357, 375, 393, 411, 431, 452, 474, 497,
+    521, 546, 572, 599, 628, 659, 690, 724,
+    776, 814, 853, 894, 937, 982, 1029, 1079,
+    1131, 1185, 1242, 1302, 1365, 1431, 1499, 1572,
+    1647, 1727, 1810, 1897, 1988, 2084, 2184, 2289,
+    2399, 2515, 2636, 2763, 2896, 3035, 3181, 3334,
+    3494, 3663, 3839, 4024, 4217, 4420, 4633, 4856,
+    5089, 5334, 5591, 5860, 6142, 6437, 6747, 7072,
+    7412, 7769, 8142, 8534, 8945, 9375, 9826, 10299,
+    10795, 11314, 11859, 12429, 13027, 13654, 14311, 15000,
+];
+
+/* The default frequency of each band, as an index into the table above -
+ * which is also where the bands get their names. Two of the three are
+ * the NEAREST step to a round number rather than the number itself: the
+ * M8 shows about 1 kHz and about 5 kHz, and the table's nearest rungs
+ * are 982 Hz and 5089 Hz. There is no step on exactly 1000 or 5000. */
+const M8_EQ_BANDS = [
+    { name: "Low", stem: "L", freqStep: 21 },
+    { name: "Mid", stem: "M", freqStep: 69 },
+    { name: "High", stem: "H", freqStep: 104 },
+];
+
+/* TYPE and MODE are NOT here, and are not an oversight: neither is
+ * assignable over MIDI on the M8 - they are selectors you move on the
+ * device - so a knob pointed at one would be a knob that does nothing.
+ * For the record, TYPE is one of LOWCUT, LOWSHELF, BELL, BANDPASS,
+ * HI.SHELF, HI.CUT and ALLPASS, and MODE one of STEREO, MID, SIDE, LEFT
+ * and RIGHT.
+ *
+ * `def` is an M8 byte, as everywhere else in this catalogue, and the
+ * factory halves it for a knob that counts in CC steps - so a frequency
+ * default is its table index doubled. Gain and Q both default to the
+ * middle of their travel: 0.00 dB and Q 50. */
+const M8_EQ_BAND_PARAMS = [
+    { suffix: "GN", label: "Gain", def: 0x80, display: KNOB_DISPLAY_EQ_GAIN },
+    { suffix: "FQ", label: "Freq", display: KNOB_DISPLAY_EQ_FREQ },
+    { suffix: "Q", label: "Q", def: 0x80, display: KNOB_DISPLAY_EQ_Q },
+];
+
+/* The ends of the two computed readings, so the formatter and this
+ * catalogue cannot drift apart. LOW and HIGH are the ends of the KNOB's
+ * travel, not of the number: Q reads 01 at the bottom and 99 at the top. */
+const EQ_GAIN_RANGE_DB = 40;
+const EQ_Q_LOW = 1;
+const EQ_Q_HIGH = 99;
+
+/* Flat rather than a band step then a parameter step: fifteen rows is one
+ * scrolling list, and "Low Gain" reads as well in it as "Gain" would two
+ * clicks deeper. */
+const M8_EQ_PARAMS = (() => {
+    const out = [];
+    for (const band of M8_EQ_BANDS) {
+        for (const p of M8_EQ_BAND_PARAMS) {
+            out.push({
+                m: `${band.stem}${p.suffix}`,
+                label: `${band.name} ${p.label}`,
+                /* Frequency is the one row whose default differs per
+                 * band - it is what LOW, MID and HIGH mean. */
+                def: p.def === undefined ? band.freqStep * 2 : p.def,
+                display: p.display,
+            });
+        }
+    }
+    return out;
+})();
+
+/* The EQs themselves. Only the slot path needs a number; the other four
+ * are one EQ each and are told apart by the header line. */
+const M8_EQ_SLOT_MAX = 0x7F;      /* 128 slots, 00-7F */
+const M8_EQ_TARGETS = [
+    { name: "Slot", ctx: null },
+    { name: "Main Mix", ctx: "EQMix" },
+    { name: "ModFX", ctx: "EQMFX" },
+    { name: "Delay", ctx: "EQDly" },
+    { name: "Reverb", ctx: "EQRev" },
+];
+
 /* --------------------------------------------------- instrument: generic */
 
 /* The rows every instrument type carries. Defaults confirmed against the
@@ -2156,6 +2762,8 @@ const M8_STEM_INDEX = (() => {
     };
     addParams(M8_MIXER_PARAMS, "mix");
     for (const g of M8_SEND_GROUPS) addParams(g.params, "send", g.ctx);
+    /* No ctx: which EQ it is varies per knob and comes from the wizard. */
+    addParams(M8_EQ_PARAMS, "eq");
     addParams(M8_INSTRUMENT_GENERIC, "inst");
     for (const t of M8_INSTRUMENT_TYPES) addParams(typeParamsFor(t), "inst");
     for (const t of M8_MOD_TYPES) addParams(t.params, "mod");
@@ -2283,6 +2891,10 @@ function addKnobsFromEntry(song, entry, number, target, vizMode, ctx) {
             name: m8KnobName(member.m, number),
             def: member.def,
             scale: member.scale,
+            /* A catalogue row may bring its own reading - an EQ frequency
+             * is hertz, not a number out of the wire. Absent for almost
+             * everything, which leaves makeKnobConfig's Hex default. */
+            display: member.display,
             detail: memberDetail(ctx, member, entry),
             viz: groupId ? { group: groupId, kind: entry.vizKind, role: member.role } : undefined,
         });
@@ -2346,6 +2958,16 @@ function connectKnobsFromEntry(song, entry, number, vizMode, ctx, index) {
         const member = members[i];
         const noteScaled = member.scale === M8_NOTE_SCALE;
         const raw = member.def === undefined ? 0 : (noteScaled ? member.def : member.def / 2);
+        /* Re-pointing a knob at an EQ row brings that row's reading with
+         * it, so a knob connected to "Low Freq" shows hertz rather than
+         * whatever it counted in before. Done BEFORE the value is set, so
+         * the min and max travel to the new scale and the value below
+         * lands on it. */
+        if (member.display !== undefined && knob.display !== member.display) {
+            const wasFine = knobFineHex(knob);
+            knob.display = member.display;
+            rescaleKnobForDisplay(knob, wasFine);
+        }
         knob.name = m8KnobName(member.m, number);
         knob.detail = memberDetail(ctx, member, entry);
         /* The old value described the old parameter, so it is not worth
@@ -2693,20 +3315,19 @@ function getActivePage() {
  * rather than two.
  * ============================================================================ */
 
-/* "songs" and "exit" are ACTION rows: they fire on click and never enter
- * edit mode, the same shape Knob Settings uses for Add/Remove. */
-/* "songs", "mainKnob" and "exit" are ACTION rows: they fire on click
- * and never enter edit mode.
+/* "mainKnob" and "exit" are ACTION rows: they fire on click and never
+ * enter edit mode, the same shape Knob Settings uses for Add/Remove.
  *
  * The main knob's CC, channel, send mode and display used to sit here
  * as four rows of the seven, which made a list mostly about ONE knob
  * that is not even part of a song. They are a screen of their own now,
  * behind Main Knob. */
+/* No "songs" row: the song list is a screen of its own, and Shift+step 1
+ * reaches it from here just as it does from anywhere else. */
 const SETTINGS_ROWS = [
-    "songs", "knobChannel", "mainKnob", "oddRows", "knobLeds", "exit",
+    "knobChannel", "mainKnob", "oddRows", "knobLeds", "exit",
 ];
 const SETTINGS_LABELS = {
-    songs: "Songs",
     knobChannel: "Knob Chan",
     mainKnob: "Main Knob",
     oddRows: "Odd Rows",
@@ -2727,14 +3348,11 @@ function openSettings() {
 
 function closeSettings() {
     settingsOpen = false;
-    queuePadRedraw();
-    updateMoveViewPulse();
-    updateSongStepLeds();
+    repaintFromMemory();
 }
 
 function settingsRowValue(row) {
     switch (row) {
-        case "songs": return String(songs.length);
         /* Channels are stored 0-15 on the wire and shown 1-16, which is
          * how M8 (and everything else) numbers them. */
         case "knobChannel": return String(settings.knobChannel + 1);
@@ -2782,55 +3400,63 @@ function exitModule() {
     else if (typeof host_return_to_menu === "function") host_return_to_menu();
 }
 
+/* THIS SCREEN TAKES THE JOGWHEEL AND BACK, AND NOTHING ELSE.
+ *
+ * A menu used to swallow the whole surface, which meant opening one
+ * stopped the pads, the transport and the mode buttons dead - you could
+ * not glance at a setting without the M8 going deaf. Everything except
+ * the wheel and Back now falls through to its ordinary handling and
+ * reaches the M8 as usual.
+ *
+ * Shift falls through too, deliberately. The main dispatch is what
+ * tracks it and forwards it to the Launchpad, and this screen's own
+ * Shift gestures read the same flag a moment later - so letting it past
+ * costs nothing and keeps the M8's idea of Shift honest.
+ *
+ * Returns true when it consumed the message. */
 function handleSettingsInput(data) {
-    if (data[0] !== 0xb0) return;
+    if (data[0] !== 0xb0) return false;
 
     const moveControlNumber = data[1];
     const pressed = data[2] === 127;
 
-    if (moveControlNumber === moveSHIFT) {
-        shiftHeld = pressed;
-        return;
-    }
+    if (moveControlNumber !== moveJogTurn
+        && moveControlNumber !== moveWHEEL
+        && moveControlNumber !== moveBACK) return false;
+    notePressConsumed(moveControlNumber, pressed);
 
     if (moveControlNumber === moveJogTurn) {
         const delta = decodeDelta(data[2]);
-        if (delta === 0) return;
+        if (delta === 0) return true;
         if (settingsEntered) {
             adjustSetting(SETTINGS_ROWS[settingsCursor], Math.sign(delta));
         } else {
             settingsCursor = Math.max(0, Math.min(SETTINGS_ROWS.length - 1,
                                                   settingsCursor + Math.sign(delta)));
         }
-        return;
+        return true;
     }
 
-    if (!pressed) return;
+    if (!pressed) return true;          /* the release of one we took */
 
     if (moveControlNumber === moveBACK) {
-        if (settingsEntered) { settingsEntered = false; return; }
+        if (settingsEntered) { settingsEntered = false; return true; }
         closeSettings();
-        return;
+        return true;
     }
-
-    if (moveControlNumber !== moveWHEEL) return;
 
     const row = SETTINGS_ROWS[settingsCursor];
-    if (row === "songs") {
-        settingsOpen = false;
-        openSongManagement();
-        return;
-    }
     if (row === "mainKnob") {
         settingsOpen = false;
         openMainKnob();
-        return;
+        return true;
     }
     if (row === "exit") {
         exitModule();
-        return;
+        return true;
     }
     settingsEntered = !settingsEntered;
+    return true;
 }
 
 /* ============================================================================
@@ -2883,8 +3509,10 @@ function adjustMainKnob(field, step) {
             settings.masterMode = clamp(settings.masterMode + step, 0, KNOB_MODE_OPTIONS.length - 1);
             break;
         case "display":
+            /* MASTER_DISPLAY_KEYS, not KNOB_DISPLAY_OPTIONS: the main
+             * knob is offered the original four only. */
             settings.masterDisplay = clamp(settings.masterDisplay + step,
-                                           0, KNOB_DISPLAY_OPTIONS.length - 1);
+                                           0, MASTER_DISPLAY_KEYS.length - 1);
             break;
         default:
             return;
@@ -2899,7 +3527,7 @@ function handleMainKnobInput(data) {
     const pressed = data[2] === 127;
 
     if (moveControlNumber === moveSHIFT) {
-        shiftHeld = pressed;
+        setShiftHeld(pressed);
         return;
     }
 
@@ -2937,7 +3565,7 @@ function drawMainKnob() {
         getLabel: (field) => MAIN_KNOB_LABELS[field],
         getValue: (field) => mainKnobRowValue(field),
     });
-    drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Settings"]);
+    drawMenuFooter(["Jog: Move", "Clk: Edit", "Bck: Settings"]);
 }
 
 function drawSettings() {
@@ -2950,7 +3578,7 @@ function drawSettings() {
         getLabel: (row) => SETTINGS_LABELS[row],
         getValue: (row) => settingsRowValue(row),
     });
-    drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Close"]);
+    drawMenuFooter(["Jog: Move", "Clk: Edit", "Bck: Close"]);
 }
 
 /* ============================================================================
@@ -2977,37 +3605,48 @@ function songMgmtItems() {
     return [ADD_SONG_ITEM].concat(songs);
 }
 
+/* The cursor walks rows and row 0 is not a song. Returns -1 there, which
+ * is what stops Copy, Delete and rename acting on a song that is not
+ * under the cursor. */
+function songMgmtSongIndex() {
+    const i = songMgmtCursor - 1;
+    return i >= 0 && i < songs.length ? i : -1;
+}
+function songMgmtLastRow() {
+    return songs.length;
+}
+
 function openSongManagement() {
     songMgmtOpen = true;
+    /* A question never survives the screen it was asked on. */
+    closeDeleteConfirm();
     const activeIndex = songs.findIndex((s) => s.id === activeSongId);
     songMgmtCursor = activeIndex >= 0 ? activeIndex + 1 : 0;
 }
 
 function closeSongManagement() {
     songMgmtOpen = false;
-    /* Back to Settings, which is where the list was opened from - Back
-     * means "up one", not "all the way out", the same as everywhere else
-     * in this module. Choosing a song is the exception: it closes the
-     * whole thing, because you asked to go and play that song. */
-    settingsOpen = true;
+    closeDeleteConfirm();
+    /* OUT, not up. Songs is its own screen now - reached with Shift+step
+     * 1 rather than from inside Settings - so there is no "up" for Back
+     * to go to. It used to land in Settings because that is where the
+     * list lived. */
+    settingsOpen = false;
     /* M8's LED updates kept updating lppNoteValueMap while this screen owned
      * the pads (see onMidiMessageExternal), just without painting them - so
      * the cache may now be ahead of what the pads are actually showing.
      * Reuse the same resync path the view-toggle uses to catch it up. */
-    queuePadRedraw();
-    updateMoveViewPulse();
-    updateSongStepLeds();
+    repaintFromMemory();
 }
 
 /* Picking a song is "go and play this", so it leaves the menus entirely
  * rather than stepping back up to Settings. */
 function closeSongManagementToPerform() {
     closeSongManagement();
-    settingsOpen = false;
 }
 
 function renameSong(song) {
-    openTextEntry({
+    openKeyboard({
         title: "Song Name",
         initialText: song.name,
         onConfirm: (text) => {
@@ -3033,8 +3672,8 @@ function createSong() {
  * with the song, so holding Shift and spinning keeps moving the same one
  * instead of walking off it after the first step. */
 function moveSong(step) {
-    const from = songMgmtCursor - 1;   /* row 0 is "+ Add Song" */
-    if (from < 0) return;
+    const from = songMgmtSongIndex();
+    if (from < 0) return;              /* on Add Song or Settings */
     const to = from + step;
     if (to < 0 || to >= songs.length) return;
     const [song] = songs.splice(from, 1);
@@ -3048,7 +3687,7 @@ function deleteSong(index) {
     if (songs.length <= 1) return; /* always at least one song */
     const wasActive = songs[index].id === activeSongId;
     songs.splice(index, 1);
-    if (songMgmtCursor > songs.length) songMgmtCursor = songs.length;
+    if (songMgmtCursor > songMgmtLastRow()) songMgmtCursor = songMgmtLastRow();
     if (wasActive) {
         activeSongId = songs[0].id;
         activePageIndex = 0;
@@ -3057,62 +3696,219 @@ function deleteSong(index) {
     updateSongStepLeds();
 }
 
-function handleSongMgmtInput(data) {
-    if (routeTextEntryInput(data)) return;
+/* "Song", "Song 2", "Song 3" - a number is appended only when the plain
+ * name is taken, and it counts up until it finds a gap. Nicer than
+ * "Song copy copy", which is what duplicating a duplicate would give. */
+function uniqueSongName(base) {
+    const taken = new Set(songs.map((s) => s.name));
+    if (!taken.has(base)) return base;
+    for (let n = 2; n < 1000; n++) {
+        const candidate = `${base} ${n}`;
+        if (!taken.has(candidate)) return candidate;
+    }
+    return base;
+}
 
-    const isCCMsg = data[0] === 0xb0;
-    if (!isCCMsg) return; /* pads/notes: no meaning here outside text entry */
+/* A song, copied whole - every page, every knob, every setting on every
+ * knob. The copy lands directly BELOW the original rather than at the
+ * end, because the list order is also the preset-button order and a
+ * duplicate is nearly always wanted next to the thing it came from.
+ *
+ * The graphic group ids are regenerated rather than copied. They are
+ * only ever matched within one page, so sharing them across two songs
+ * would probably be harmless - but "probably harmless" is not worth
+ * carrying when a fresh id costs nothing. */
+function duplicateSong(index) {
+    const source = songs[index];
+    if (!source) return;
+
+    const groupIds = new Map();
+    const copy = {
+        id: makeSongId(),
+        name: uniqueSongName(source.name),
+        pages: (source.pages || []).map((page) => ({
+            name: page.name || "",
+            knobs: (page.knobs || []).map((knob) => {
+                if (!knob) return null;
+                const clone = Object.assign({}, knob);
+                if (knob.viz) {
+                    const old = knob.viz.group;
+                    if (old && !groupIds.has(old)) groupIds.set(old, `g${makeSongId()}`);
+                    clone.viz = Object.assign({}, knob.viz, { group: groupIds.get(old) || old });
+                }
+                return clone;
+            }),
+        })),
+    };
+
+    songs.splice(index + 1, 0, copy);
+    songMgmtCursor = index + 2;      /* row 0 is "+ Add Song" */
+    markSongsDirty();
+    updateSongStepLeds();
+}
+
+/* DELETING ASKS FIRST.
+ *
+ * Deleting a song throws away every page of knobs on it, and the button
+ * is one press with nothing held - so it opens a two-row list instead of
+ * acting, with the cursor parked on Cancel. Anything that is not a
+ * deliberate move onto "Delete" and a click leaves the song alone.
+ *
+ * `blocked` is the other half of the same screen: the last song cannot
+ * go, and saying so is better than a button that quietly does nothing. */
+let songMgmtConfirm = null;
+
+function openDeleteConfirm(index) {
+    const song = songs[index];
+    if (!song) return;
+    songMgmtConfirm = {
+        index,
+        name: song.name,
+        blocked: songs.length <= 1,
+        cursor: 0,                   /* Cancel - never start on the door out */
+    };
+}
+
+function closeDeleteConfirm() {
+    songMgmtConfirm = null;
+}
+
+/* Returns true when it consumed the message, so the list below does not
+ * also act on it. */
+function handleDeleteConfirmInput(moveControlNumber, pressed, data) {
+    if (!songMgmtConfirm) return false;
+
+    if (moveControlNumber === moveJogTurn) {
+        const delta = decodeDelta(data[2]);
+        if (delta !== 0 && !songMgmtConfirm.blocked) {
+            songMgmtConfirm.cursor = Math.max(0, Math.min(1, songMgmtConfirm.cursor + Math.sign(delta)));
+        }
+        return true;
+    }
+    if (!pressed) return true;
+
+    if (moveControlNumber === moveBACK
+        || (moveControlNumber === MoveDelete && shiftHeld)) {
+        closeDeleteConfirm();
+        return true;
+    }
+    if (moveControlNumber === moveWHEEL) {
+        const confirmed = !songMgmtConfirm.blocked && songMgmtConfirm.cursor === 1;
+        const index = songMgmtConfirm.index;
+        closeDeleteConfirm();
+        if (confirmed) deleteSong(index);
+        return true;
+    }
+    /* Not swallowed any more: a question owns the wheel and the two
+     * buttons that answer it, and everything else carries on reaching
+     * the M8 the way it does behind every other screen. */
+    return false;
+}
+
+/* Takes the jogwheel, Back, and the two buttons its Shift gestures use -
+ * and nothing else. See handleSettingsInput for why the rest falls
+ * through. Returns true when it consumed the message. */
+function handleSongMgmtInput(data) {
+    /* The name keyboard is the exception: while it is up the PADS are
+     * letters, so it really does own the surface. */
+    if (isTextEntryActive()) { routeTextEntryInput(data); return true; }
+
+    if (data[0] !== 0xb0) return false;  /* pads, steps, knob touches: not ours */
 
     const moveControlNumber = data[1];
     const pressed = data[2] === 127;
 
-    /* Shift isn't tracked by the normal dispatch while this screen owns
-     * input (that logic lives further down onMidiMessageInternal, which this
-     * screen bypasses entirely) - track it here too, since delete uses it as
-     * a safety modifier below. */
-    if (moveControlNumber === moveSHIFT) {
-        shiftHeld = pressed;
-        return;
-    }
+    const isOurs = moveControlNumber === moveJogTurn
+        || moveControlNumber === moveWHEEL
+        || moveControlNumber === moveBACK
+        /* Copy and Delete only when shifted - unshifted they are the
+         * Launchpad's Duplicate and Clear and belong to the M8. */
+        || ((moveControlNumber === MoveCopy || moveControlNumber === MoveDelete) && shiftHeld);
+    if (!isOurs) return false;
+    notePressConsumed(moveControlNumber, pressed);
+
+    if (handleDeleteConfirmInput(moveControlNumber, pressed, data)) return true;
 
     if (moveControlNumber === moveJogTurn) {
         const delta = decodeDelta(data[2]);
-        if (delta === 0) return;
+        if (delta === 0) return true;
         if (shiftHeld) {
             moveSong(Math.sign(delta));
-            return;
+            return true;
         }
-        songMgmtCursor = Math.max(0, Math.min(songs.length, songMgmtCursor + Math.sign(delta)));
-        return;
+        songMgmtCursor = Math.max(0, Math.min(songMgmtLastRow(), songMgmtCursor + Math.sign(delta)));
+        return true;
     }
 
-    if (!pressed) return;
+    if (!pressed) return true;          /* the release of one we took */
 
     if (moveControlNumber === moveBACK) {
         closeSongManagement();
     } else if (moveControlNumber === moveWHEEL) {
+        /* Shift+click renames the song under the cursor. It used to be
+         * Menu, which is the Launchpad's Note button and so belongs to
+         * the M8 - the same reason Capture no longer makes a song. The
+         * screen's own gestures all live on Shift now. */
+        if (shiftHeld) {
+            if (songMgmtSongIndex() >= 0) renameSong(songs[songMgmtSongIndex()]);
+            return true;
+        }
         if (songMgmtCursor === 0) {
             createSong();
-            return;
+            return true;
         }
-        activeSongId = songs[songMgmtCursor - 1].id;
+        activeSongId = songs[songMgmtSongIndex()].id;
         activePageIndex = 0;
         cachedSongId = null;     /* different song, different page shape */
         markSongsDirty();
         closeSongManagementToPerform();   /* relights the preset LEDs on the way out */
-    } else if (moveControlNumber === moveCAP) {
-        createSong();
-    } else if (moveControlNumber === moveMENU) {
-        if (songMgmtCursor > 0) renameSong(songs[songMgmtCursor - 1]);
-    } else if (moveControlNumber === MoveDelete && shiftHeld) {
-        if (songMgmtCursor > 0) deleteSong(songMgmtCursor - 1);
+    } else if (moveControlNumber === MoveCopy) {
+        if (shiftHeld && songMgmtSongIndex() >= 0) duplicateSong(songMgmtSongIndex());
+    } else if (moveControlNumber === MoveDelete) {
+        /* Shift on both, to match the knob cursor: the same two buttons
+         * do the same two jobs to whatever the cursor is on, and a
+         * gesture that means "duplicate this" on one screen should not
+         * mean it with a different grip on the other. The confirmation
+         * below is still the real safety for Delete. */
+        if (shiftHeld && songMgmtSongIndex() >= 0) openDeleteConfirm(songMgmtSongIndex());
     }
+    return true;
+}
+
+/* The song name is the whole point of the question, so it gets the
+ * header; the rows are the two answers. A blocked delete has one row and
+ * no choice to make - the header says why, and the row is the way out. */
+function drawDeleteConfirm() {
+    clear_screen();
+    if (songMgmtConfirm.blocked) {
+        drawMenuHeader("Only song");
+        drawMenuList({
+            items: ["OK"],
+            selectedIndex: 0,
+            getLabel: (item) => item,
+            getValue: () => "",
+        });
+        drawMenuFooter(["The last song cannot be deleted"]);
+        return;
+    }
+    drawMenuHeader(`Delete ${songMgmtConfirm.name}?`);
+    drawMenuList({
+        items: ["Cancel", "Delete"],
+        selectedIndex: songMgmtConfirm.cursor,
+        getLabel: (item) => item,
+        getValue: () => "",
+    });
+    drawMenuFooter(["Jog: Move", "Clk: Pick", "Bck: Cancel"]);
 }
 
 function drawSongMgmt() {
     if (isTextEntryActive()) {
         tickTextEntry();
         drawTextEntry();
+        return;
+    }
+    if (songMgmtConfirm) {
+        drawDeleteConfirm();
         return;
     }
     clear_screen();
@@ -3123,7 +3919,7 @@ function drawSongMgmt() {
         getLabel: (item) => item.name,
         getValue: (item) => (item === ADD_SONG_ITEM ? "" : (item.id === activeSongId ? "*" : "")),
     });
-    drawMenuFooter(["Jog: Move", "Shift+Jog: Reorder", "Click: Select"]);
+    drawMenuFooter(songMgmtHints());
 }
 
 /* ============================================================================
@@ -3199,6 +3995,27 @@ function handleKnobSelectInput(data) {
     if (control === moveJogTurn) {
         const delta = decodeDelta(data[2]);
         if (delta === 0) return true;
+        /* SHIFT CARRIES THE KNOB WITH THE CURSOR.
+         *
+         * The same gesture the song list uses to reorder songs, for the
+         * same reason: the thing under the cursor is what you want to
+         * move, and the wheel is already in your hand. A knob that is
+         * part of a graphic takes the whole picture with it, and the
+         * step is "next valid position" rather than "one slot" - which
+         * is what lets a four-knob envelope move between rows at all,
+         * since it cannot slide within one.
+         *
+         * Page to page is deliberately not offered: a slot IS a
+         * physical encoder, so a knob on a page you are not looking at
+         * would sit under no encoder. */
+        if (shiftHeld) {
+            const moved = moveKnobBlock(knobSelectIndex, Math.sign(delta));
+            if (moved !== knobSelectIndex) {
+                knobSelectIndex = moved;
+                markSongsDirty();
+            }
+            return true;
+        }
         /* PAST THE END IS THE NEXT PAGE, not a wall. The cursor is how
          * every knob is reached, and stopping at slot 8 made the pages
          * past this one unreachable without first putting the cursor
@@ -3219,6 +4036,24 @@ function handleKnobSelectInput(data) {
             next = 0;
         }
         knobSelectIndex = next;
+        return true;
+    }
+
+    /* Shift+Copy duplicates what the cursor is on, Shift+Delete removes
+     * it. Shift rather than a bare press because both are one keystroke
+     * away from losing work, and because an unshifted Copy or Delete
+     * still belongs to the M8. */
+    if (control === MoveCopy || control === MoveDelete) {
+        if (!pressed || !shiftHeld) return true;
+        const song = getActiveSong();
+        const page = getActivePage();
+        if (!song || !page || !page.knobs[knobSelectIndex]) return true;
+        if (control === MoveCopy) {
+            knobSelectIndex = copyKnobBlock(knobSelectIndex);
+        } else {
+            removeKnobAt(song, activePageIndex, knobSelectIndex);
+            cachedSongId = null;
+        }
         return true;
     }
 
@@ -3311,8 +4146,7 @@ function closeKnobEdit() {
      * trick) - force ensureSongPageMeta to rebuild instead of serving the
      * pre-edit cache. */
     cachedSongId = null;
-    queuePadRedraw();
-    updateMoveViewPulse();
+    repaintFromMemory();
 }
 
 /* The slots a move operates on: the whole viz group if this knob is in
@@ -3356,15 +4190,19 @@ function validBlockStarts(size) {
  * Because the step is "next VALID start" rather than "one slot", a block
  * that cannot slide within its row jumps to the other row instead - which
  * is the only way a four-knob envelope can be moved at all. */
-function moveKnobSlot(step) {
+/* Returns where the moved knob ended up, or the index it was given when
+ * nothing moved - so a caller can follow its own cursor along without
+ * knowing how far the block travelled. */
+function moveKnobBlock(index, step) {
     const page = getActivePage();
-    if (!page) return;
+    if (!page) return index;
     const knobs = page.knobs;
-    const { start, size } = knobMoveBlock(page, knobEditIndex);
+    if (!knobs[index]) return index;        /* an empty slot has nothing to move */
+    const { start, size } = knobMoveBlock(page, index);
 
     const starts = validBlockStarts(size);
     const target = starts[starts.indexOf(start) + step];
-    if (target === undefined) return;
+    if (target === undefined) return index;
 
     const moving = knobs.slice(start, start + size);
     /* Whatever occupies the destination and is not part of the block
@@ -3387,12 +4225,54 @@ function moveKnobSlot(step) {
     moving.forEach((k, i) => { knobs[target + i] = k; });
     displaced.forEach((k, i) => { if (freed[i] !== undefined) knobs[freed[i]] = k; });
 
-    knobEditIndex += target - start;   /* keep editing the knob, not the slot */
     cachedSongId = null;               /* slot -> key mapping changed */
+    return index + (target - start);   /* follow the knob, not the slot */
+}
+
+/* Knob Settings still calls it by its old name and on its own cursor. */
+function moveKnobSlot(step) {
+    knobEditIndex = moveKnobBlock(knobEditIndex, step);
+}
+
+/* Copy the knob under the cursor - or its whole graphic - into the next
+ * run of free slots.
+ *
+ * A graphic travels whole for the same reason it moves whole: its knobs
+ * have to sit adjacent on one row or viz.mjs will not draw it, so
+ * copying one member alone would produce a knob with a role in a picture
+ * that is not there. The copy gets a NEW group id and fresh CCs - two
+ * knobs learned to the same CC would move together on the M8, which is
+ * the opposite of what a copy is for.
+ *
+ * Returns where the copy landed, so the cursor can follow it. */
+function copyKnobBlock(index) {
+    const song = getActiveSong();
+    const page = getActivePage();
+    if (!song || !page || !page.knobs[index]) return index;
+
+    const { start, size } = knobMoveBlock(page, index);
+    const block = page.knobs.slice(start, start + size);
+    const place = nextFreeKnobRun(song, size);
+    const target = song.pages[place.pageIndex];
+    if (!target) return index;
+
+    const groupId = block.some((k) => k && k.viz) ? `g${makeSongId()}` : null;
+    block.forEach((knob, i) => {
+        if (!knob) return;
+        const clone = Object.assign({}, knob, { cc: nextFreeCc(song) });
+        if (knob.viz) clone.viz = Object.assign({}, knob.viz, { group: groupId });
+        target.knobs[place.slot + i] = clone;
+    });
+
+    activePageIndex = place.pageIndex;
+    ensureSparePage(song);
+    cachedSongId = null;
+    markSongsDirty();
+    return place.slot + (index - start);
 }
 
 function renameKnob(knob) {
-    openTextEntry({
+    openKeyboard({
         title: "Rename Knob",
         initialText: knob.name,
         onConfirm: (text) => {
@@ -3435,7 +4315,7 @@ function handleKnobEditInput(data) {
     const pressed = data[2] === 127;
 
     if (moveControlNumber === moveSHIFT) {
-        shiftHeld = pressed;
+        setShiftHeld(pressed);
         return;
     }
 
@@ -3575,7 +4455,7 @@ function drawKnobEdit() {
             return "";
         },
     });
-    drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Close"]);
+    drawMenuFooter(["Jog: Move", "Clk: Edit", "Bck: Close"]);
 }
 
 /* ============================================================================
@@ -3631,8 +4511,7 @@ function closeKnobWizard() {
     knobWizardConnect = -1;
     knobWizardStack = [];
     cachedSongId = null; /* the page's shape may have changed - rebuild the meta */
-    queuePadRedraw();
-    updateMoveViewPulse();
+    repaintFromMemory();
 }
 
 /* Each frame carries the CONTEXT the path has narrowed to so far - "MIX",
@@ -3779,6 +4658,36 @@ function genericFrame() {
         (e) => (e.entry ? pickEntry(e.entry, null) : openOtherKnobEntry()));
 }
 
+/* Which of M8's EQs, then its fifteen rows.
+ *
+ * The slot path asks for a number the way the instrument path does, and
+ * the name carries it - "LGN0A" - so two slots' worth of knobs on one
+ * page stay apart. The four named EQs have no number to carry, so their
+ * knobs are named bare and told apart by the header, exactly as the
+ * Mixer and Sends entries already are. */
+function eqTargetFrame() {
+    return listFrame(
+        "EQ", M8_EQ_TARGETS,
+        (t) => t.name,
+        (t) => (t.ctx ? String(M8_EQ_PARAMS.length) : "00-7F"),
+        (t) => {
+            if (t.ctx) {
+                pushWizardFrame(paramListFrame(t.name, M8_EQ_PARAMS, undefined, t.ctx));
+                return;
+            }
+            pushWizardFrame({
+                kind: WIZ_HEX, title: "EQ Slot", value: 0,
+                max: M8_EQ_SLOT_MAX,
+                onPick: (n) => {
+                    const slot = n.toString(16).toUpperCase().padStart(2, "0");
+                    pushWizardFrame(paramListFrame(
+                        `EQ ${slot}`, M8_EQ_PARAMS, n, `EQ${slot}`));
+                },
+                ctx: "",
+            });
+        });
+}
+
 function rootWizardFrame() {
     const groups = [
         { name: "Generic", open: () => pushWizardFrame(genericFrame()) },
@@ -3799,6 +4708,7 @@ function rootWizardFrame() {
                 (g) => String(g.params.length),
                 (g) => pushWizardFrame(paramListFrame(g.name, g.params, undefined, g.ctx)))),
         },
+        { name: "EQ", open: () => pushWizardFrame(eqTargetFrame()) },
     ];
     return listFrame("Add Knob", groups, (g) => g.name, () => "", (g) => g.open());
 }
@@ -3866,7 +4776,7 @@ function typeParamsFor(type) {
  * name. For an M8 parameter this module does not know, or a mapping to
  * something else entirely on the same channel. */
 function openOtherKnobEntry() {
-    openTextEntry({
+    openKeyboard({
         title: "Knob Name",
         initialText: "PRM",
         onConfirm: (text) => {
@@ -3895,7 +4805,7 @@ function handleKnobWizardInput(data) {
     const pressed = data[2] === 127;
 
     if (moveControlNumber === moveSHIFT) {
-        shiftHeld = pressed;
+        setShiftHeld(pressed);
         return;
     }
 
@@ -3935,9 +4845,15 @@ function wizardTurn(frame, step) {
          * sixteen is the scroll this screen exists to avoid. */
         const digit = frame.editing === 0 ? (frame.value >> 4) & 0xF : frame.value & 0xF;
         const next = Math.max(0, Math.min(15, digit + step));
-        frame.value = frame.editing === 0
+        const value = frame.editing === 0
             ? (next << 4) | (frame.value & 0xF)
             : (frame.value & 0xF0) | next;
+        /* `max` where the range is not a whole byte - EQ slots stop at 7F.
+         * The digit REFUSES rather than snapping to the ceiling, which is
+         * the same way it already refuses to carry past F: winding finds
+         * the end and stays there instead of jumping somewhere else. */
+        if (frame.max !== undefined && value > frame.max) return;
+        frame.value = value;
         return;
     }
     frame.cursor = Math.max(0, Math.min(frame.items.length - 1, frame.cursor + step));
@@ -3993,7 +4909,7 @@ function drawKnobWizard() {
         getLabel: (item) => frame.getLabel(item),
         getValue: (item) => frame.getValue(item),
     });
-    drawMenuFooter(["Jog: Move", "Click: Pick", "Back: Up"]);
+    drawMenuFooter(["Jog: Move", "Clk: Pick", "Bck: Up"]);
 }
 
 function drawWizardHex(frame) {
@@ -4010,7 +4926,7 @@ function drawWizardHex(frame) {
             return hex;
         },
     });
-    drawMenuFooter(["Jog: Move", "Click: Edit", "Back: Up"]);
+    drawMenuFooter(["Jog: Move", "Clk: Edit", "Bck: Up"]);
 }
 
 /* Adapter from param_pages' { fillRect, print, textWidth } contract to
@@ -4140,7 +5056,13 @@ function ensureSongPageMeta(song, pageIndex, page) {
  * calls by position. That worked for a labelled cell and could not work
  * at all for a cell covered by a graphic, which prints nothing - and
  * those are exactly the cells that now need a label drawn. */
-const CELL_LABEL_Y = [30, 56];
+/* Moved up when the grid was shortened for the hint bar: the two rows
+ * now sit in 0..54 rather than 0..63, so renderPage's own label
+ * baselines came up with them. Measured from what renderPage draws for
+ * an ordinary dial, not guessed - and test_knobpage pins them, so a
+ * change in render_page.mjs fails a test rather than quietly putting our
+ * graphic labels on a different line from its dial labels. */
+const CELL_LABEL_Y = [26, 48];
 const CELL_W = SCREEN_WIDTH / COLS;
 
 function slotLabelCentre(slot) {
@@ -4149,6 +5071,58 @@ function slotLabelCentre(slot) {
 
 function slotLabelBaseline(slot) {
     return CELL_LABEL_Y[Math.floor(slot / KNOBS_PER_ROW)];
+}
+
+/* WHAT THE BAR ALONG THE BOTTOM SAYS.
+ *
+ * Three pairs, each a key in an inverted pill and what it does beside
+ * it - the same footer every Schwung param page carries, so the knob
+ * page reads like the rest of the system rather than like a screen with
+ * no way out.
+ *
+ * HOLDING SHIFT SWAPS ALL THREE. The knob page has two sets of
+ * gestures and only room for one, and the Shift set is the one nobody
+ * can guess: that the step buttons reach the two menus, and that
+ * holding Shift while turning a knob auditions the change and puts it
+ * back. Shift is the natural place to ask "what else is there", so
+ * asking it answers itself. */
+function knobPageHints() {
+    /* The knob cursor is an OVERLAY on this page rather than a screen of
+     * its own, so the bar under it is this one - and while it is up the
+     * wheel walks knobs instead of pages, which is the whole reason the
+     * label cannot just say "page" everywhere. */
+    if (knobSelectOpen) {
+        if (shiftHeld) return ["Jog: Move", "Cpy: Copy", "Del: Del"];
+        return ["Jog: Knob", "Clk: Edit", "Bck: Exit"];
+    }
+    if (shiftHeld) return ["St1: Song", "St2: Setup", "Knb: Try"];
+    /* THE PAGE HINT ONLY WHEN THERE IS A PAGE WORTH TURNING TO.
+     *
+     * Counting pages is not the same as counting pages of KNOBS. Filling
+     * a page makes ensureSparePage add an empty one behind it so there
+     * is always somewhere to put the next knob - so a song with one full
+     * page has two pages, and the wheel's only destination is a blank.
+     * That is a place the wheel can go, not a place worth advertising.
+     *
+     * Pages that hold something are what count, and the hint appears
+     * once there is more than one of them. */
+    const song = getActiveSong();
+    const filled = song
+        ? song.pages.filter((pg) => pg.knobs.some((k) => k)).length
+        : 0;
+    const canPage = filled > 1;
+    return canPage
+        ? ["Jog: Page", "Clk: Edit", "Sft: More"]
+        : ["Clk: Edit", "Sft: More"];
+}
+
+/* The song list. Shift turns the two buttons into copy and delete, and
+ * the plain click hint gives up its place to say so - there is only room
+ * for three, and what Shift adds is worth more than repeating what an
+ * unshifted click does. */
+function songMgmtHints() {
+    if (shiftHeld) return ["Jog: Order", "Cpy: Dup", "Del: Del"];
+    return ["Jog: Move", "Clk: Sel", "Bck: Exit"];
 }
 
 /* Draw one cell's label row: a name, or a value in an inverted pill.
@@ -4350,6 +5324,29 @@ function formatKnobReadoutValue(knob) {
     if (knob.display === KNOB_DISPLAY_UNIT) {
         return (knob.value / 127).toFixed(2);
     }
+    /* M8'S OWN EQ READINGS.
+     *
+     * Gain is centred on 64 for the same reason the bipolar reading is:
+     * that is the CC landing on M8's own centre, so the default reads a
+     * true 0.00 rather than a third of a decibel off it. The top of the
+     * travel reaches 39.38 rather than 40.00 - the same "a 7-bit CC
+     * cannot quite reach the top" that hex shows as FE. */
+    if (knob.display === KNOB_DISPLAY_EQ_GAIN) {
+        return (((knob.value - 64) / 64) * EQ_GAIN_RANGE_DB).toFixed(2);
+    }
+    /* 01 at the bottom of the travel, 99 at the top, 50 in the middle -
+     * turning the knob up narrows the band. Two digits, as the editor
+     * prints it. */
+    if (knob.display === KNOB_DISPLAY_EQ_Q) {
+        const q = EQ_Q_LOW + Math.round((knob.value / 127) * (EQ_Q_HIGH - EQ_Q_LOW));
+        return String(q).padStart(2, "0");
+    }
+    /* Frequency is a LOOKUP, not a curve - see M8_EQ_FREQ_TABLE. One
+     * entry per CC step, which is why the table is 128 long. */
+    if (knob.display === KNOB_DISPLAY_EQ_FREQ) {
+        const i = Math.max(0, Math.min(M8_EQ_FREQ_TABLE.length - 1, Math.round(knob.value)));
+        return String(M8_EQ_FREQ_TABLE[i]);
+    }
     if (knob.display === KNOB_DISPLAY_BIPOLAR) {
         /* Centred on 64, because that is the CC that lands on M8's own
          * centre of 0x80. The cost is that the top of the range reads
@@ -4411,7 +5408,15 @@ function drawSongPage() {
         ? page.knobs[activeKnobIndex] : null;
     const headerRight = (activeKnob && knobDetail(activeKnob)) || page.name || "";
 
+    /* THE GRID IS SHORTENED TO MAKE ROOM FOR THE BAR.
+     *
+     * renderPage lays its two rows out inside whatever rect it is given
+     * and expects the caller to draw anything below - the same division
+     * every other Schwung param page uses. RULE_Y (55) is where the
+     * chrome starts, so the eight cells get rows 0..54 and the hint bar
+     * gets 55..63. */
     renderPage(songPageDrawCtx, {
+        rect: { x: 0, y: 0, w: SCREEN_WIDTH, h: RULE_Y },
         page: { name: headerRight, keys: pageKeys },
         metaIndex: cachedMetaIndex,
         values,
@@ -4437,6 +5442,8 @@ function drawSongPage() {
         const active = isKnobReadoutActive(slot);
         drawSlotLabel(slot, active ? formatKnobReadoutValue(knob) : knob.name, active);
     }
+
+    drawMenuFooter(knobPageHints());
 
     /* An ordinary cell already has its name from renderPage; only the
      * active one needs swapping for its value. */
@@ -4559,6 +5566,7 @@ function handleMasterKnobTurn(data) {
 /* External MIDI handler (from M8) */
 globalThis.onMidiMessageExternal = function (data) {
     if (data[0] === MidiClock) return;
+    traceIncoming(data);
 
     let value = data[0];
     let maskedValue = (value & 0xf0);
@@ -4591,7 +5599,28 @@ globalThis.onMidiMessageExternal = function (data) {
         for (let i = 0; i <= sysexEndPos; i++) {
             sysexBuffer.push(data[i]);
         }
-        if (arraysAreEqual(sysexBuffer, m8InitSysex)) {
+        if (isMidiCiDiscovery(sysexBuffer)) {
+            /* A real Launchpad Pro MK3 has no MIDI-CI at all: it hears
+             * Discovery and says nothing. We used to answer with a
+             * proper Discovery Reply, which is correct MIDI-CI and
+             * still left the iPadOS M8 app sending no LEDs - so the
+             * reply is gone, on the theory that looking like the
+             * hardware matters more than being protocol-complete, and
+             * that answering may put CoreMIDI or the app into a
+             * negotiation a real Launchpad never enters.
+             *
+             * The introduction still goes out, because that is the
+             * message the app demonstrably reads - each one made it
+             * print "Launchpad Connected". Marking connected is what
+             * damps the retry, so it stays too: without it we would
+             * introduce ourselves on a loop and spam that banner. */
+            sendLPPIdentity();
+            markM8Connected();
+        } else if (isDeviceInquiry(sysexBuffer)) {
+            /* Answered EVERY time it is asked, not just the first. A
+             * host that asks again - after its own restart, or because
+             * the first answer arrived before it was listening - is
+             * asking because it does not know yet. */
             initLPP();
         } else if (sysexBuffer.length) {
             markM8Connected();
@@ -4662,13 +5691,27 @@ function tickShiftHandover() {
     if (shiftHeld) sendShiftToM8(!owned);
 }
 
+/* WHAT ACTUALLY BORROWS THE PADS.
+ *
+ * Every menu screen used to count: Song Management, Knob Settings and
+ * the wizard all suppressed the LED relay while open. But none of them
+ * draws on the pads - only the KEYBOARD does, and it is the reason the
+ * others were ever listed. The cost of counting them all was that the
+ * grid stayed away from the moment a menu opened until the last one
+ * closed, so leaving the keyboard left Move's own pad colours showing
+ * underneath rather than the M8's.
+ *
+ * So the relay stands aside for the keyboard alone. Menus keep the M8's
+ * grid lit and live underneath them, and closing the keyboard puts it
+ * straight back. */
+function padsAreBorrowed() {
+    return isTextEntryActive();
+}
+
 function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
-    /* Song Management, Knob Settings and the Add Knob wizard all own the
-     * pads/buttons while open (text_entry.mjs reuses the pad grid for
-     * typing) - keep tracking M8's state above so a resync (queuePadRedraw,
-     * on close) can catch the pads up, but don't paint over whatever screen
-     * is currently showing. */
-    if (screenOwnsSurface()) return;
+    /* M8's updates are tracked above whether or not they are painted,
+     * so the resync on hand-back has something to replay. */
+    if (padsAreBorrowed()) return;
 
     let activeLppToMovePadMap = padMapLppToMove();
     let moveNoteNumber = activeLppToMovePadMap.get(lppNoteNumber);
@@ -4718,7 +5761,19 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
     let moveControlNumber = activeLppToMoveControlMap.get(lppNoteNumber);
 
     if (moveControlNumber === moveLOGO) {
-        liveMode = moveVelocity > 0;
+        /* CC 31 is a WHITE led - it reads the byte as a BRIGHTNESS, not
+         * as a palette index - so the M8's colour is translated to lit
+         * or not rather than passed through. Passed through it landed on
+         * whatever brightness the palette number happened to be, which
+         * for the logo's colour is a long way short of on.
+         *
+         * The same trap as the lamps under the steps, and for the same
+         * reason ledFor() cannot be asked: it decides RGB-or-white by
+         * looking the control up in MoveRGBLeds, and 31 is in there as
+         * the step NOTE. Notes and CCs are separate address spaces, and
+         * this 31 is the CC. */
+        moveVelocity = lppVelocity > 0 ? WHITE_BRIGHT : 0x00;
+        liveMode = moveVelocity === WHITE_BRIGHT;
         updatePLAYLed();
     }
 
@@ -4741,19 +5796,82 @@ function applyLppLed(lppNoteNumber, lppVelocity, maskedValue, value) {
 }
 
 /* Internal MIDI handler (from Move) */
-globalThis.onMidiMessageInternal = function (data) {
-    if (songMgmtOpen) {
-        handleSongMgmtInput(data);
-        return;
+/* A PRESS TAKEN BY A SCREEN MUST NOT LEAVE ITS RELEASE BEHIND.
+ *
+ * A screen closes on the press, so by the time the release arrives there
+ * is nothing open to claim it - it falls through to the ordinary
+ * handling and reaches the M8 as a button-up for a button-down the M8
+ * never saw. Back does this every time, because closing is what Back is
+ * for.
+ *
+ * So a consumed press is remembered and the matching release swallowed
+ * once. A screen that is still up claims its own release and clears the
+ * note on the way past, which keeps the two in step. */
+const swallowedPresses = new Set();
+
+function notePressConsumed(control, pressed) {
+    if (pressed) swallowedPresses.add(control);
+    else swallowedPresses.delete(control);
+}
+
+function swallowConsumedRelease(data) {
+    if (data[0] !== 0xb0 || data[2] === 127) return false;
+    return swallowedPresses.delete(data[1]);
+}
+
+/* Shut whichever menu is up, without going "back" - a shortcut switches
+ * screens rather than stepping out of one. */
+function closeAllMenus() {
+    if (songMgmtOpen) closeSongManagement();
+    if (mainKnobOpen) closeMainKnob();
+    if (settingsOpen) closeSettings();
+    if (knobWizardOpen) closeKnobWizard();
+    if (knobEditOpen) closeKnobEdit();
+    if (knobSelectOpen) closeKnobSelect();
+}
+
+/* THE TWO MENU SHORTCUTS WORK FROM ANYWHERE, each other included.
+ *
+ * Shift+step 1 is Songs and Shift+step 2 is Settings, wherever you are -
+ * so the pair are two doors into one place rather than a place with a
+ * door in it, and you can cross straight from one to the other without
+ * backing out first.
+ *
+ * Checked BEFORE the screens are routed to, because every one of them
+ * would otherwise swallow it: a menu takes the whole surface while it is
+ * up and ignores notes entirely, so the press would simply vanish.
+ *
+ * Not while the pad keyboard is up. There the pads are letters, and
+ * taking one would type nothing and jump screens instead. */
+function handleMenuShortcut(data) {
+    if (data[0] !== 0x90 || data[2] !== 127) return false;
+    if (!shiftHeld || isTextEntryActive()) return false;
+
+    if (data[1] === SONGS_STEP_NOTE) {
+        if (!songMgmtOpen) { closeAllMenus(); openSongManagement(); }
+        return true;
     }
+    if (data[1] === SETTINGS_STEP_NOTE) {
+        if (!settingsOpen) { closeAllMenus(); openSettings(); }
+        return true;
+    }
+    return false;
+}
+
+globalThis.onMidiMessageInternal = function (data) {
+    traceStrangeInternal(data);
+    if (handleMenuShortcut(data)) return;
+    /* Songs and Settings take the wheel, Back and their own Shift
+     * gestures, and let everything else fall through to the ordinary
+     * handling below - so the pads, the transport and the mode buttons
+     * keep working while a menu is on screen. */
+    if (songMgmtOpen && handleSongMgmtInput(data)) return;
     if (mainKnobOpen) {
         handleMainKnobInput(data);
         return;
     }
-    if (settingsOpen) {
-        handleSettingsInput(data);
-        return;
-    }
+    if (settingsOpen && handleSettingsInput(data)) return;
+    if (swallowConsumedRelease(data)) return;
     if (knobSelectOpen && handleKnobSelectInput(data)) return;
     if (knobEditOpen) {
         handleKnobEditInput(data);
@@ -4781,6 +5899,12 @@ globalThis.onMidiMessageInternal = function (data) {
          * grid halves are the mode buttons. */
         if (moveNoteNumber === moveWHEELTouch) return;
 
+        /* The PRESS was taken by handleMenuShortcut above; the release
+         * has to go too, or the M8 hears a note-off for a T1 press it
+         * never got. Note 16 is the Launchpad's T1, so left alone it
+         * would be forwarded as a track button. */
+        if (moveNoteNumber === SONGS_STEP_NOTE && shiftHeld) return;
+
         let lppNote = activeMoveToLppPadMap.get(moveNoteNumber);
 
         if (!lppNote) {
@@ -4789,7 +5913,12 @@ globalThis.onMidiMessageInternal = function (data) {
              * even steps, 16-30, are), so M8 never sees them. */
             const presetIndex = SONG_STEP_NOTES.indexOf(moveNoteNumber);
             if (presetIndex >= 0) {
-                if (data[2] === 127) selectSongByStep(presetIndex);
+                /* Step 2's SHIFTED press was taken by
+                 * handleMenuShortcut; what is left here is the plain
+                 * one, which still picks a song. The M8 sees neither. */
+                if (data[2] === 127 && !(moveNoteNumber === SETTINGS_STEP_NOTE && shiftHeld)) {
+                    selectSongByStep(presetIndex);
+                }
                 return;
             }
 
@@ -4880,22 +6009,20 @@ globalThis.onMidiMessageInternal = function (data) {
 
         /* Note: Shift+Wheel exit is handled at host level */
 
-        /* Wheel click. Shift+click opens Settings, of which the song list
-         * is one row (confirmed free - this combo was never forwarded to
-         * M8 either way, see
-         * docs/plans/2026-09-10-song-based-knob-config.md). */
+        /* Wheel click raises the knob cursor. The two menus moved off it
+         * onto the step row - Shift+step 1 for Songs, Shift+step 2 for
+         * Settings - so a shifted click is simply not a gesture any
+         * more, and is swallowed rather than falling through to the
+         * cursor: Shift+click reading as a plain click is the kind of
+         * thing that opens a screen you did not ask for. */
         if (moveControlNumber === moveWHEEL && data[2] === 0x7f) {
-            if (shiftHeld) {
-                openSettings();
-                return;
-            }
-            openKnobSelect();
+            if (!shiftHeld) openKnobSelect();
             return;
         }
 
         /* Jog turn scrolls through the active song's pages. MoveMainKnob
          * (CC14) was completely unclaimed before this - see
-         * docs/plans/2026-09-10-song-based-knob-config.md. One page per
+         * the song-based knob design. One page per
          * detent regardless of turn speed (page counts are small, a
          * proportional jump would overshoot), clamped rather than wrapping.
          *
@@ -4938,7 +6065,7 @@ globalThis.onMidiMessageInternal = function (data) {
 
         if (pressed) {
             if (moveControlNumber === moveSHIFT) {
-                shiftHeld = true;
+                setShiftHeld(true);
             }
             /* THE ODD VIEW SCROLLS TWO ROWS AT A TIME - BUT ONLY THE
              * PLAIN ARROW.
@@ -4962,7 +6089,7 @@ globalThis.onMidiMessageInternal = function (data) {
             move_midi_external_send([2 << 4 | 0x9, 0x90, lppNote, 100]);
         } else {
             if (moveControlNumber === moveSHIFT) {
-                shiftHeld = false;
+                setShiftHeld(false);
                 /* Letting go is what puts an auditioned knob back. */
                 revertAuditionedKnobs();
             }
@@ -4998,17 +6125,44 @@ globalThis.init = function () {
      * which cost a diagnostic round trip. */
     traceOn = std.loadFile(tracePath("trace_on")) != null;
 
-    /* Armed here rather than on connect - see armM8Nudge. On a reopen
-     * the M8 says nothing at all, so anything waiting to be triggered
-     * by the M8 waits forever. */
-    armM8Nudge();
+    /* What the grid looked like when we left, which is what goes back
+     * on the surface - the M8 is not asked for anything. */
+    ledsRestored = loadSurfaceSnapshot();
     padReassert = PAD_REASSERT_TICKS;
     songStepLedReassert = SONG_STEP_LED_REASSERT_TICKS;
 
-    /* Proactively send LPP identity on startup - this handles the case where
-     * M8 sent its identity request before the module loaded. The M8 will
-     * recognize the LPP identity response and start communicating. */
-    sendLPPIdentity();
+    /* DO NOT INTRODUCE OURSELVES IF WE ALREADY KNOW THE M8.
+     *
+     * The introduction is not free: hearing it, the M8 initialises the
+     * control surface from scratch, which lands it on its own default
+     * screen - Session - and repaints. That is exactly what re-picking
+     * CTRL SURFACE does, and it is the reason that trick fixes a dead
+     * grid. It used to be invisible here, because a fresh module also
+     * started on Session and the two agreed. Now that the screen is
+     * restored, introducing ourselves drags the M8 back to Session a
+     * moment after we arrive and throws the restore away - on the M8's
+     * own display as well as ours.
+     *
+     * So when a snapshot gave us a screen, we take the M8 as still
+     * connected - it was when we saved, and it has not been told
+     * anything since - and say nothing. A genuinely restarted M8
+     * broadcasts its own Device Inquiry, which we still answer, so the
+     * case this introduction was written for is covered anyway.
+     *
+     * With no snapshot we introduce ourselves as before: this handles
+     * the M8 having asked before the module was loaded. */
+    if (surfaceRestored) {
+        /* Restored into MEMORY, not onto the surface. Nothing is painted
+         * and nothing is claimed: a file cannot tell us the M8 is
+         * plugged in, and saying it is on the strength of one is how a
+         * grid of old LEDs came to sit there looking live with nothing
+         * connected. The pads stay dark and the screen says "Waiting for
+         * M8" until the M8 itself says something, at which point
+         * markM8Connected puts the remembered grid up. */
+        awaitingM8WithSnapshot = true;
+    } else {
+        sendLPPIdentity();
+    }
 };
 
 /* Called once on teardown, regardless of which mechanism triggered it (the
@@ -5021,6 +6175,9 @@ globalThis.onUnload = function () {
         saveSongs();
         songsDirty = false;
     }
+    /* So the way back in has a grid and a screen to restore - see
+     * loadSurfaceSnapshot. */
+    saveSurfaceSnapshot();
 };
 
 globalThis.tick = function () {
@@ -5029,16 +6186,38 @@ globalThis.tick = function () {
      * This handles the case where M8 sent its identity request before
      * the module loaded (e.g., when entering overtake mode after M8 is
      * already connected). */
-    if (!m8Connected) {
+    /* ONE INTRODUCTION PER ASKING.
+     *
+     * This retried once a second until an LED arrived, on the theory
+     * that an app switched into Launchpad mode late would otherwise
+     * never hear an identity. The iOS app answers each identity with
+     * "Launchpad Connected" on its own screen, so a retry a second
+     * turned into that banner a second - it was re-accepting the device
+     * over and over, and whatever it does after accepting never got a
+     * chance to finish. So the introduction goes out when we are asked
+     * and while nobody has answered at all, and not otherwise. */
+    /* Not while a restored screen is waiting to be confirmed: the
+     * introduction is what makes the M8 re-initialise its surface and
+     * land on Session, which would throw away the very screen we are
+     * holding. An M8 that is actually there will say something the
+     * moment anything is pressed, and that is what confirms it. */
+    if (!m8Connected && !awaitingM8WithSnapshot) {
         initRetryTicks++;
         if (initRetryTicks >= INIT_RETRY_INTERVAL) {
             initRetryTicks = 0;
             sendLPPIdentity();
         }
     }
+    tickTextEntryHandback();
+    /* Driven from the tick rather than from each of the half-dozen
+     * places that could change the answer - the cursor opening, moving,
+     * landing on an empty slot, a copy, a delete, a page change. It
+     * compares against what is already lit and returns without sending
+     * anything when nothing has changed, so the cost of asking every
+     * frame is a comparison. */
+    updateKnobCursorHints();
     tickShiftHandover();
     tickModuleConfig();
-    tickM8Nudge();
     tickPadReassert();
     tickPadAnimation();
     drainPadRedraw();

@@ -37,35 +37,55 @@ src/
   parameter by CC; the user maps each CC on the device (cursor on the
   parameter, hold OPTION, turn the knob).
 - **Parameter defaults come from the manual's SCREENSHOTS, not its text** —
-  see the memory `m8-manual-images-hold-parameter-defaults` and the "Where
-  the default values came from" section of the plan doc before changing
-  them.
+  see the memory `m8-manual-images-hold-parameter-defaults`, and the
+  catalogue header comment in `src/ui.js`, which records where each
+  family of defaults came from, before changing them. The EQ is the
+  exception: its editor prints dB and Hz rather than hex, so there is no
+  byte on the screenshot to copy and those defaults follow the
+  catalogue's stated conventions instead.
 - Shift+Jog-click opens Song Management (browse/switch/create/rename/delete,
   reusing `shared/menu_layout.mjs`'s list and `shared/text_entry.mjs`'s
-  keyboard). See `docs/plans/2026-09-10-song-based-knob-config.md` for the
-  full design and status.
+  keyboard).
+- A 3-band parametric EQ catalogue: 128 numbered slots plus the main mix
+  and the three sends, each with gain, frequency and Q per band, reading
+  in the M8's own dB / Q / Hz. TYPE and MODE are deliberately absent —
+  they are selectors on the device and cannot be driven by a CC.
 
 ## Testing
 
-`tests` live in the session scratchpad rather than the repo so far, but the
-pattern is worth keeping: load the REAL `src/ui.js` in Node by rewriting its
-`/data/UserData/schwung/shared/` imports to the local `schwung` checkout and
-stubbing the device globals (`print`, `fill_rect`, `set_pixel`, `clear_screen`,
-`text_width`, `move_midi_*_send`, `host_ensure_dir`, and a `std` shim), then
-drive the module through `onMidiMessageInternal` and assert on the draw log.
-Two gotchas: `drawMenuList`'s scrollbar needs `set_pixel` stubbed (only
-reached once a list is long enough to scroll), and `drawMenuHeader` draws its
-title with a pixel font, so a header is invisible to `print`-log assertions —
-assert on list contents instead.
+```bash
+./scripts/test.sh       # the whole suite
+```
+
+Tests live in `tests/` and load the **real** `src/ui.js` — see
+`tests/README.md` for how the harness works, what each suite covers, and
+the handful of gotchas worth knowing before adding one.
 
 **`node --check` cannot see the failure this module fails with most often.**
 Four times now a `const` has been placed above another `const` it refers to;
 the reference is evaluated during module evaluation, while the target is still
 in its temporal dead zone, so the module throws `ReferenceError: Cannot access
 'X' before initialization` **on import** while the syntax check passes clean.
-Running any harness test catches it immediately — so run one before every
-deploy, not just when the change looks risky. Where a value is only needed at
-call time (a path built from `MODULE_DIR`, say), derive it in a **function**
-rather than a `const`: a function body is not evaluated until it runs, by which
-point every declaration has, and the ordering hazard disappears rather than
-being re-sorted.
+Running the suite catches it immediately — so run it before every deploy, not
+just when the change looks risky. Where a value is only needed at call time (a
+path built from `MODULE_DIR`, say), derive it in a **function** rather than a
+`const`: a function body is not evaluated until it runs, by which point every
+declaration has, and the ordering hazard disappears rather than being
+re-sorted.
+
+## Deploying
+
+```bash
+./scripts/build.sh      # package into dist/
+./scripts/install.sh    # copy dist/ to the Move
+```
+
+**`install.sh` only copies `dist/`.** Running it without `build.sh` first
+silently ships the previous package — the install reports success and the
+device keeps the old behaviour, which is an expensive way to learn that a
+fix "did not work". Build, install, then confirm:
+
+```bash
+ssh ableton@move.local 'md5sum /data/UserData/schwung/modules/overtake/m8/ui.js'
+md5sum src/ui.js
+```

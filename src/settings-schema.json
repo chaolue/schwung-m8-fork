@@ -88,7 +88,7 @@
                 "off"
             ],
             "default": "neutral",
-            "help": "The colour sweep each knob's lit ring walks as its value moves, for every knob that does not name one of its own. The Main knob has no ring of its own and is not affected."
+            "help": "The colour sweep the light under each knob walks as its value moves, for every knob that does not name one of its own. The Main knob has no light of its own and is not affected."
         }
     ]
 }

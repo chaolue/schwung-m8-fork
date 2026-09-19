@@ -127,7 +127,9 @@ var READ_URL = "/api/remote-ui/module-assets/m8/songs.json";
 var UPLOAD_URL = "/files/upload";
 
 var MODES = ["Absolute", "Relative"];
-var DISPLAYS = ["0-127", "Hex", "0-1", "-1..1"];
+var DISPLAYS = ["0-127", "Hex", "0-1", "-1..1", "dB", "Q", "Hz"];
+/* The last three read a knob the way M8's EQ editor does. Kept in step
+ * with KNOB_DISPLAY_OPTIONS in ui.js - the stored value is the INDEX. */
 var MULTS = ["1/4x", "1/3x", "1/2x", "1x", "2x"];
 var SWEEPS = ["Neutral", "Synthwave", "Rose", "Rainbow", "Off"];
 var MULT_DEFAULT = 3;
@@ -446,7 +448,7 @@ function renderSlot(song, page, pi, si, dupes) {
         led.appendChild(o);
     });
     led.value = typeof knob.led === "number" ? String(knob.led) : "";
-    led.title = "Colour sweep for this knob's lit ring. Song follows the one in Settings.";
+    led.title = "Colour sweep for the light under this knob. Song follows the one in Settings.";
     led.addEventListener("change", function () {
         if (led.value === "") delete knob.led;
         else knob.led = parseInt(led.value, 10);
